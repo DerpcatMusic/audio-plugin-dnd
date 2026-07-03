@@ -64,7 +64,7 @@ impl WaylandExternalDragRequest {
 /// Why the current window cannot start a native Wayland external drag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaylandExternalDragError {
-    /// The active baseview platform is not a native Wayland backend.
+    /// The active window platform is not a native Wayland backend.
     UnsupportedBackend,
     /// The backend has no active `wl_surface` for the plugin editor.
     MissingSurface,

@@ -21,6 +21,10 @@ use crate::{ExternalDragPayload, FileDragPayloadData};
 mod dnd;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// Raw native window context required by platform drag launchers.
 #[derive(Clone, Copy, Debug)]
@@ -135,6 +139,12 @@ impl std::fmt::Display for ExternalDragError {
 
 impl std::error::Error for ExternalDragError {}
 
+impl From<String> for ExternalDragError {
+    fn from(message: String) -> Self {
+        Self::StartFailed(message)
+    }
+}
+
 /// Native backend interface implemented by toolkit adapters.
 pub trait ExternalDragBackend {
     /// Start an external file drag.
@@ -215,24 +225,7 @@ fn platform_start_file_drag(
     window: DragWindow,
     payload: ExternalDragPayload,
 ) -> Result<(), ExternalDragError> {
-    match window.window() {
-        RawWindowHandle::Win32(handle) if !handle.hwnd.is_null() => {
-            emit_backend_event(format!(
-                "[dnd#{}] Windows OLE route selected; native launcher extraction pending",
-                payload.id
-            ));
-            Err(ExternalDragError::BackendUnavailable(
-                "Windows OLE launcher is not linked in this crate build yet".to_string(),
-            ))
-        }
-        RawWindowHandle::Win32(_) => Err(ExternalDragError::MissingWindowHandle(
-            "window does not have a valid Win32 HWND",
-        )),
-        other => Err(ExternalDragError::UnsupportedBackend {
-            backend: window.backend_kind(),
-            window: format!("{other:?}"),
-        }),
-    }
+    windows::start_external_file_drag(window, payload)
 }
 
 #[cfg(target_os = "macos")]
@@ -240,24 +233,7 @@ fn platform_start_file_drag(
     window: DragWindow,
     payload: ExternalDragPayload,
 ) -> Result<(), ExternalDragError> {
-    match window.window() {
-        RawWindowHandle::AppKit(handle) if !handle.ns_view.is_null() => {
-            emit_backend_event(format!(
-                "[dnd#{}] macOS AppKit route selected; native launcher extraction pending",
-                payload.id
-            ));
-            Err(ExternalDragError::BackendUnavailable(
-                "macOS AppKit launcher is not linked in this crate build yet".to_string(),
-            ))
-        }
-        RawWindowHandle::AppKit(_) => Err(ExternalDragError::MissingWindowHandle(
-            "window does not have a valid AppKit NSView",
-        )),
-        other => Err(ExternalDragError::UnsupportedBackend {
-            backend: window.backend_kind(),
-            window: format!("{other:?}"),
-        }),
-    }
+    macos::start_external_file_drag(window, payload)
 }
 
 #[cfg(not(any(

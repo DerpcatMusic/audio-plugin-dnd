@@ -32,10 +32,8 @@ crate the resulting path and optional preview metadata.
 - Raw-window backend adapter contract: implemented.
 - Linux X11/XWayland XDND backend: implemented.
 - Native Wayland drag source: implemented, experimental.
-- Windows OLE backend: protocol route documented; backend adapter API is the
-  next extraction target.
-- macOS AppKit backend: protocol route documented; backend adapter API is the
-  next extraction target.
+- Windows OLE backend: implemented.
+- macOS AppKit backend: implemented.
 
 This v0.1 release is the shared protocol core and experimental native Wayland
 runtime. It is designed to become a small standard surface that GUI/toolkit

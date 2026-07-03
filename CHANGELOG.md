@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- Added Windows OLE and macOS AppKit native launchers behind the raw-window backend API.
+- Added target-specific dependencies for Windows shell drag payloads and AppKit pasteboard drags.
+- Updated backend status documentation to mark Linux, Windows, and macOS launchers as implemented.
+
 ## 0.1.2
 
 - Added the Linux X11/XWayland XDND native launcher behind the raw-window backend API.

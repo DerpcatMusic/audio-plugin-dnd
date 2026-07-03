@@ -805,15 +805,19 @@ fn hypr_preview_monitors(x11_monitors: &[PreviewMonitor]) -> Vec<HyprMonitor> {
 }
 
 fn preview_env_scale() -> f32 {
-    ["BUFFR_DND_PREVIEW_SCALE", "GDK_SCALE", "CLUTTER_SCALE"]
-        .into_iter()
-        .find_map(|key| std::env::var(key).ok()?.parse::<f32>().ok())
-        .filter(|scale| scale.is_finite() && *scale > 0.0)
-        .unwrap_or(1.0)
+    [
+        "AUDIO_PLUGIN_DND_PREVIEW_SCALE",
+        "GDK_SCALE",
+        "CLUTTER_SCALE",
+    ]
+    .into_iter()
+    .find_map(|key| std::env::var(key).ok()?.parse::<f32>().ok())
+    .filter(|scale| scale.is_finite() && *scale > 0.0)
+    .unwrap_or(1.0)
 }
 
 fn preview_coordinate_remap_enabled() -> bool {
-    std::env::var("BUFFR_DND_PREVIEW_REMAP")
+    std::env::var("AUDIO_PLUGIN_DND_PREVIEW_REMAP")
         .map(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
@@ -885,7 +889,7 @@ impl XdndSource {
             &ConfigureWindowAux::new().x(-10_000).y(-10_000),
         )
         .map_err(|err| err.to_string())?;
-        set_window_identity(&conn, source_window, &atoms, b"BUFFR DND")?;
+        set_window_identity(&conn, source_window, &atoms, b"Audio Plugin DND")?;
 
         let timestamp = server_time(&conn, source_window, atoms.timestamp_property)?;
         conn.change_property32(
@@ -968,7 +972,7 @@ impl XdndSource {
     }
 
     fn verbose_logging(&self) -> bool {
-        std::env::var("BUFFR_DND_VERBOSE")
+        std::env::var("AUDIO_PLUGIN_DND_VERBOSE")
             .map(|value| {
                 matches!(
                     value.to_ascii_lowercase().as_str(),
@@ -2181,7 +2185,7 @@ fn set_window_identity(
         window,
         atoms.wm_class,
         AtomEnum::STRING,
-        b"buffr-dnd\0BUFFR-DND\0",
+        b"audio-plugin-dnd\0AUDIO-PLUGIN-DND\0",
     )
     .map_err(|err| err.to_string())?;
     conn.change_property8(
