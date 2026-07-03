@@ -7,8 +7,8 @@ on:
       - main
 
 jobs:
-  rust:
-    name: Rust
+  linux:
+    name: Linux
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,7 +23,36 @@ jobs:
         run: cargo fmt --check
 
       - name: Test
-        run: cargo test
+        run: cargo test --all-features
 
       - name: Check
-        run: cargo check
+        run: cargo check --all-features
+
+      - name: Package dry run
+        run: cargo publish --dry-run
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Windows backend
+        run: cargo check --all-features
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check macOS backend
+        run: cargo check --all-features
