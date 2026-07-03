@@ -1,6 +1,6 @@
 //! File payload construction for external drag operations.
 //!
-//! This mirrors the payload formats BUFFR offers to DAWs and file managers:
+//! This mirrors the payload formats accepted by common DAWs and file managers:
 //! URI-list variants for DND-aware targets, a GNOME copied-files payload for
 //! file managers, and plain path text for permissive hosts.
 
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn file_offers_include_uri_and_plain_payloads() {
-        let payload = FileDragPayloadData::new(vec![PathBuf::from("/tmp/BUFFR take.flac")])
+        let payload = FileDragPayloadData::new(vec![PathBuf::from("/tmp/plugin take.flac")])
             .expect("payload should accept a non-empty file list");
 
         let offers = payload.offers();
@@ -214,15 +214,15 @@ mod tests {
         assert_eq!(offers.len(), FILE_DRAG_OFFER_COUNT);
         assert!(offers.iter().any(|offer| {
             offer.mime_type() == MIME_TEXT_URI_LIST
-                && offer.data() == b"file:///tmp/BUFFR%20take.flac\r\n"
+                && offer.data() == b"file:///tmp/plugin%20take.flac\r\n"
         }));
         assert!(offers
             .iter()
             .any(|offer| offer.mime_type() == MIME_TEXT_PLAIN
-                && offer.data() == b"/tmp/BUFFR take.flac"));
+                && offer.data() == b"/tmp/plugin take.flac"));
         assert!(offers.iter().any(|offer| {
             offer.mime_type() == MIME_GNOME_COPIED_FILES
-                && offer.data() == b"copy\nfile:///tmp/BUFFR%20take.flac\n"
+                && offer.data() == b"copy\nfile:///tmp/plugin%20take.flac\n"
         }));
     }
 

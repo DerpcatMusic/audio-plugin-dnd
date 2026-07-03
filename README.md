@@ -2,15 +2,15 @@
 
 Drag-and-drop protocol helpers for Rust audio plugin GUIs.
 
-`audio-plugin-dnd` is the shared drag-out layer extracted from BUFFR. It is
-meant for plugins that render audio, MIDI, presets, clips, or other temporary
-files and then let the user drag those files from the plugin editor into a DAW,
-file manager, or desktop target.
+`audio-plugin-dnd` is a reference API for plugin drag-out. It is meant for
+plugins and small creative apps that render audio, MIDI, presets, clips, or
+other temporary files and then let the user drag those files from the editor
+into a DAW, file manager, or desktop target.
 
 The crate owns the reusable DND protocol pieces:
 
-- BUFFR-style drag arming, movement threshold, render-cache slot, short UI
-  flash state, and self-drop blocking.
+- Drag arming, movement threshold, render-cache slot, short UI flash state, and
+  self-drop blocking.
 - File drag payload construction for `text/uri-list`, UTF-8 URI lists,
   `text/x-uri`, KDE URI lists, GNOME copied-files payloads, and plain path
   text.
@@ -30,18 +30,16 @@ crate the resulting path and optional preview metadata.
 - File MIME payload generation: implemented.
 - Toolkit-neutral drag queue: implemented.
 - Native Wayland drag source: implemented, experimental.
-- X11/XWayland XDND backend: proven in BUFFR's Nice Plug/baseview adapter,
-  not extracted here yet.
-- Windows OLE backend: proven adapter code exists in BUFFR's GUI stack, not
-  extracted here yet.
-- macOS AppKit backend: proven adapter code exists in BUFFR's GUI stack, not
-  extracted here yet.
+- X11/XWayland XDND backend: protocol route documented; backend adapter API is
+  the next extraction target.
+- Windows OLE backend: protocol route documented; backend adapter API is the
+  next extraction target.
+- macOS AppKit backend: protocol route documented; backend adapter API is the
+  next extraction target.
 
 This v0.1 release is the shared protocol core and experimental native Wayland
-runtime. It is not yet the full drop-in BUFFR platform launcher. BUFFR works
-because its vendored Nice Plug/baseview adapter also contains the platform
-`external_drag` layer that starts XDND, OLE, and AppKit drags from real plugin
-windows.
+runtime. It is designed to become a small standard surface that GUI/toolkit
+adapters can implement consistently.
 
 Wayland is the weird part. Native Wayland drag-out requires an origin
 `wl_surface`, active `wl_seat`, `wl_data_device`, and the pointer-button serial
@@ -162,18 +160,24 @@ surface, and pointer serial before a drag begins.
 
 ## Platform Reality
 
-The same plugin-facing lifecycle can feed multiple native backends, but a
-working plugin standard needs both this core crate and a window-adapter layer:
+The same plugin-facing lifecycle can feed multiple native backends. A complete
+integration has two layers:
+
+- This crate's protocol core: file payloads, previews, queueing, gesture state,
+  and diagnostics.
+- A GUI/window adapter: code that starts the native drag from a real window
+  handle or compositor surface.
+
+The intended backend routes are:
 
 - X11/XWayland source windows use XDND.
 - Native Wayland source windows use Wayland data-device.
 - Windows uses OLE `DoDragDrop`/`CF_HDROP`.
 - macOS uses AppKit pasteboard dragging from an `NSView`.
 
-In BUFFR today, that adapter layer lives in the Nice Plug/baseview
-`external_drag` code. The extraction target for the next release is to move that
-platform launcher code behind this crate's payload and queue types so other
-plugins can use the same behavior without vendoring BUFFR's GUI stack.
+The extraction target for the next release is a public backend adapter layer
+behind this crate's payload and queue types, so plugin authors can depend on one
+comfortable API instead of each app inventing its own drag launcher.
 
 Crossing XWayland and native Wayland is not guaranteed by changing MIME payloads
 inside the plugin. That direction needs compositor/Xwayland-manager bridge

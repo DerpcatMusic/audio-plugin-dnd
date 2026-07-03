@@ -1,10 +1,10 @@
-//! BUFFR-style plugin drag lifecycle primitives.
+//! Plugin drag lifecycle primitives.
 //!
 //! The crate does not render audio or MIDI. A plugin should render its export
 //! to a temp file on the GUI/background side, then queue that path with
 //! [`ExternalDragQueue`](crate::ExternalDragQueue). This module owns the shared
 //! arming threshold, preview metadata, render cache slot, short drag flash, and
-//! self-drop tracking behavior used by BUFFR.
+//! self-drop tracking behavior.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
