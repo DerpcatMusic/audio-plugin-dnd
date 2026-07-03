@@ -1,6 +1,6 @@
 [package]
 name = "audio-plugin-dnd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Drag-and-drop protocol helpers for Rust audio plugin GUIs"
@@ -11,6 +11,7 @@ documentation = "https://docs.rs/audio-plugin-dnd"
 keywords = ["audio", "plugins", "dnd", "wayland", "gui"]
 categories = ["gui", "os::linux-apis"]
 include = [
+    "CHANGELOG.md",
     "Cargo.toml",
     "LICENSE",
     "README.md",

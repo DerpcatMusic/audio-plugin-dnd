@@ -29,6 +29,7 @@ crate the resulting path and optional preview metadata.
 - Plugin drag lifecycle: implemented.
 - File MIME payload generation: implemented.
 - Toolkit-neutral drag queue: implemented.
+- Raw-window backend adapter contract: implemented.
 - Native Wayland drag source: implemented, experimental.
 - X11/XWayland XDND backend: protocol route documented; backend adapter API is
   the next extraction target.
@@ -104,6 +105,40 @@ fn render_audio_temp_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 ```
 
+## Backend Adapter API
+
+Toolkit code can use raw window/display handles to feed the same backend
+contract regardless of whether the editor is built with baseview, winit, Vizia,
+Slint, or a custom plugin wrapper:
+
+```rust,no_run
+use audio_plugin_dnd::{
+    DragWindow, ExternalDragBackend, ExternalDragQueue, RawWindowBackend,
+};
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
+
+fn drain_drag_queue<W>(
+    window: &W,
+    queue: &mut ExternalDragQueue,
+    backend: &mut RawWindowBackend,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: HasRawDisplayHandle + HasRawWindowHandle,
+{
+    let Some(payload) = queue.take() else {
+        return Ok(());
+    };
+
+    let drag_window = DragWindow::from_window(window);
+    backend.start_file_drag(drag_window, payload)?;
+    Ok(())
+}
+```
+
+The contract is stable enough for toolkit authors to implement against. The
+native launchers are intentionally split behind this API so each platform can be
+filled in without changing plugin UI code.
+
 ## File Payloads
 
 Use `FileDragPayloadData` when implementing a backend or testing DAW/file
@@ -165,8 +200,8 @@ integration has two layers:
 
 - This crate's protocol core: file payloads, previews, queueing, gesture state,
   and diagnostics.
-- A GUI/window adapter: code that starts the native drag from a real window
-  handle or compositor surface.
+- A GUI/window adapter implementing `ExternalDragBackend`: code that starts the
+  native drag from a real window handle or compositor surface.
 
 The intended backend routes are:
 

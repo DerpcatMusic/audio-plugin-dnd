@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod backend;
 pub mod data_device;
 pub mod file_payload;
 pub mod foreign;
@@ -10,6 +11,10 @@ pub mod request;
 pub mod runtime;
 pub mod state;
 
+pub use backend::{
+    drain_backend_events, emit_backend_event, BackendStart, DragWindow, ExternalDragBackend,
+    ExternalDragError, RawWindowBackend,
+};
 pub use data_device::{ActiveWaylandDrag, PendingWaylandDrag};
 pub use file_payload::{
     file_uri, file_uri_list, gnome_copied_file_list, plain_file_list, FileDragOffer,
