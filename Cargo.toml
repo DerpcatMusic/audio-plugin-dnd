@@ -1,0 +1,24 @@
+[package]
+name = "derpcat-wayland-dnd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Reusable native Wayland drag-and-drop support for Rust GUI and plugin windows"
+license = "ISC"
+readme = "README.md"
+repository = "https://github.com/DerpcatMusic/derpcat-wayland-dnd"
+documentation = "https://docs.rs/derpcat-wayland-dnd"
+keywords = ["wayland", "drag-and-drop", "dnd", "gui", "plugin"]
+categories = ["gui", "os::linux-apis"]
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "src/**/*.rs",
+]
+
+[dependencies]
+raw-window-handle = "0.5"
+smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
+wayland-client = { version = "0.31.14", features = ["system"] }
+wayland-sys = { version = "0.31.11", features = ["client", "dlopen", "libwayland_client_1_23"] }
