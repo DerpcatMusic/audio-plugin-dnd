@@ -30,9 +30,18 @@ crate the resulting path and optional preview metadata.
 - File MIME payload generation: implemented.
 - Toolkit-neutral drag queue: implemented.
 - Native Wayland drag source: implemented, experimental.
-- X11/XWayland XDND backend: documented route, intended backend.
-- Windows OLE backend: documented route, intended backend.
-- macOS AppKit backend: documented route, intended backend.
+- X11/XWayland XDND backend: proven in BUFFR's Nice Plug/baseview adapter,
+  not extracted here yet.
+- Windows OLE backend: proven adapter code exists in BUFFR's GUI stack, not
+  extracted here yet.
+- macOS AppKit backend: proven adapter code exists in BUFFR's GUI stack, not
+  extracted here yet.
+
+This v0.1 release is the shared protocol core and experimental native Wayland
+runtime. It is not yet the full drop-in BUFFR platform launcher. BUFFR works
+because its vendored Nice Plug/baseview adapter also contains the platform
+`external_drag` layer that starts XDND, OLE, and AppKit drags from real plugin
+windows.
 
 Wayland is the weird part. Native Wayland drag-out requires an origin
 `wl_surface`, active `wl_seat`, `wl_data_device`, and the pointer-button serial
@@ -153,12 +162,18 @@ surface, and pointer serial before a drag begins.
 
 ## Platform Reality
 
-The same plugin-facing lifecycle can feed multiple native backends:
+The same plugin-facing lifecycle can feed multiple native backends, but a
+working plugin standard needs both this core crate and a window-adapter layer:
 
 - X11/XWayland source windows use XDND.
 - Native Wayland source windows use Wayland data-device.
 - Windows uses OLE `DoDragDrop`/`CF_HDROP`.
 - macOS uses AppKit pasteboard dragging from an `NSView`.
+
+In BUFFR today, that adapter layer lives in the Nice Plug/baseview
+`external_drag` code. The extraction target for the next release is to move that
+platform launcher code behind this crate's payload and queue types so other
+plugins can use the same behavior without vendoring BUFFR's GUI stack.
 
 Crossing XWayland and native Wayland is not guaranteed by changing MIME payloads
 inside the plugin. That direction needs compositor/Xwayland-manager bridge
