@@ -17,6 +17,11 @@ use raw_window_handle::{
 use crate::platform::{DragBackendKind, DragEndpointKind, DragRoute};
 use crate::{ExternalDragPayload, FileDragPayloadData};
 
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+mod dnd;
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+mod linux;
+
 /// Raw native window context required by platform drag launchers.
 #[derive(Clone, Copy, Debug)]
 pub struct DragWindow {
@@ -202,31 +207,7 @@ fn platform_start_file_drag(
     window: DragWindow,
     payload: ExternalDragPayload,
 ) -> Result<(), ExternalDragError> {
-    match window.window() {
-        RawWindowHandle::Xlib(handle) if handle.window != 0 => x11_xdnd_unavailable(payload.id),
-        RawWindowHandle::Xcb(handle) if handle.window != 0 => x11_xdnd_unavailable(payload.id),
-        RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_) => Err(
-            ExternalDragError::MissingWindowHandle("window does not have a valid X11/XWayland id"),
-        ),
-        RawWindowHandle::Wayland(_) => Err(ExternalDragError::BackendUnavailable(
-            "native Wayland drag requires a live WaylandRuntime with the initiating pointer serial"
-                .to_string(),
-        )),
-        other => Err(ExternalDragError::UnsupportedBackend {
-            backend: window.backend_kind(),
-            window: format!("{other:?}"),
-        }),
-    }
-}
-
-#[cfg(all(target_family = "unix", not(target_os = "macos")))]
-fn x11_xdnd_unavailable(drag_id: u64) -> Result<(), ExternalDragError> {
-    emit_backend_event(format!(
-        "[dnd#{drag_id}] X11/XWayland XDND route selected; native launcher extraction pending"
-    ));
-    Err(ExternalDragError::BackendUnavailable(
-        "X11/XWayland XDND launcher is not linked in this crate build yet".to_string(),
-    ))
+    linux::start_external_file_drag(window, payload)
 }
 
 #[cfg(target_os = "windows")]

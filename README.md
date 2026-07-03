@@ -30,9 +30,8 @@ crate the resulting path and optional preview metadata.
 - File MIME payload generation: implemented.
 - Toolkit-neutral drag queue: implemented.
 - Raw-window backend adapter contract: implemented.
+- Linux X11/XWayland XDND backend: implemented.
 - Native Wayland drag source: implemented, experimental.
-- X11/XWayland XDND backend: protocol route documented; backend adapter API is
-  the next extraction target.
 - Windows OLE backend: protocol route documented; backend adapter API is the
   next extraction target.
 - macOS AppKit backend: protocol route documented; backend adapter API is the
@@ -135,9 +134,9 @@ where
 }
 ```
 
-The contract is stable enough for toolkit authors to implement against. The
-native launchers are intentionally split behind this API so each platform can be
-filled in without changing plugin UI code.
+The contract is stable enough for toolkit authors to implement against. Linux
+X11/XWayland XDND is wired through this API now; the remaining native launchers
+can be filled in without changing plugin UI code.
 
 ## File Payloads
 
@@ -205,7 +204,7 @@ integration has two layers:
 
 The intended backend routes are:
 
-- X11/XWayland source windows use XDND.
+- X11/XWayland source windows use XDND through `RawWindowBackend`.
 - Native Wayland source windows use Wayland data-device.
 - Windows uses OLE `DoDragDrop`/`CF_HDROP`.
 - macOS uses AppKit pasteboard dragging from an `NSView`.

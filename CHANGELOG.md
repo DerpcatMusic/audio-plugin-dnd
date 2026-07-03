@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Added the Linux X11/XWayland XDND native launcher behind the raw-window backend API.
+- Added Linux portal file-transfer payload support for XDND targets that request portal data.
+- Added XDND diagnostics for target discovery, acceptance, data requests, and bridge behavior.
+
 ## 0.1.1
 
 - Added the first public native backend adapter contract around raw window handles.

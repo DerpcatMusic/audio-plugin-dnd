@@ -1,6 +1,6 @@
 [package]
 name = "audio-plugin-dnd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Drag-and-drop protocol helpers for Rust audio plugin GUIs"
@@ -18,9 +18,19 @@ include = [
     "src/**/*.rs",
 ]
 
+[features]
+default = []
+nice-log = []
+tracing = []
+
 [dependencies]
 percent-encoding = "2.3"
 raw-window-handle = "0.5"
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["calloop"] }
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-sys = { version = "0.31.11", features = ["client", "dlopen", "libwayland_client_1_23"] }
+
+[target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
+serde_json = "1.0"
+x11rb = { version = "0.13", features = ["randr"] }
+zbus = { version = "5.12", default-features = false, features = ["async-io", "blocking-api"] }
