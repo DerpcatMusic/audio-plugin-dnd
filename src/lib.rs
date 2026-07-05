@@ -15,9 +15,12 @@ pub mod runtime;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub mod state;
 
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+pub use backend::XdndDropRouter;
 pub use backend::{
-    drain_backend_events, emit_backend_event, BackendStart, DragWindow, ExternalDragBackend,
-    ExternalDragError, RawWindowBackend,
+    drain_backend_events, drain_backend_lifecycle_events, emit_backend_event,
+    emit_backend_lifecycle_event, BackendStart, DragWindow, ExternalDragBackend, ExternalDragError,
+    ExternalDragLifecycleEvent, ExternalDragLifecyclePhase, RawWindowBackend,
 };
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use data_device::{ActiveWaylandDrag, PendingWaylandDrag};

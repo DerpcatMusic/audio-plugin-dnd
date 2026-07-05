@@ -1,14 +1,23 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod mime;
 mod portal;
+pub(super) mod router;
 mod target;
+mod wayland_native;
 
-use super::dnd::{DragFailureKind, DragPhase, DragSessionReport, DragSessionStats, DragTargetKind};
-use super::{emit_backend_event, DragWindow, ExternalDragError};
+use super::dnd::{
+    DragCompletion, DragFailureKind, DragPhase, DragSessionReport, DragSessionStats, DragTargetKind,
+};
+use super::{
+    emit_backend_event, emit_backend_lifecycle_event, DragWindow, ExternalDragError,
+    ExternalDragLifecycleEvent, ExternalDragLifecyclePhase,
+};
 use crate::platform::{DragBackendPlan, DragEndpointKind, DragRoute};
 use crate::{ExternalDragPayload, ExternalDragPreview, FileDragPayloadData};
 use mime::MimeTargets;
@@ -47,6 +56,50 @@ const DROP_FINISH_WAIT: Duration = Duration::from_millis(260);
 const DROP_READY_FINISH_WAIT: Duration = Duration::from_millis(180);
 const DROP_SELECTION_GRACE: Duration = Duration::from_millis(80);
 
+fn active_outbound_drags() -> &'static Mutex<HashSet<u64>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ActiveOutboundDrag {
+    id: u64,
+}
+
+impl ActiveOutboundDrag {
+    fn register(id: u64) -> Self {
+        if let Ok(mut active) = active_outbound_drags().lock() {
+            active.insert(id);
+        }
+        Self { id }
+    }
+}
+
+impl Drop for ActiveOutboundDrag {
+    fn drop(&mut self) {
+        if let Ok(mut active) = active_outbound_drags().lock() {
+            active.remove(&self.id);
+        }
+    }
+}
+
+pub(super) fn has_active_outbound_drag() -> bool {
+    active_outbound_drags()
+        .lock()
+        .map(|active| !active.is_empty())
+        .unwrap_or(false)
+}
+
+fn emit_terminal_lifecycle(drag_id: u64, report: &DragSessionReport) {
+    let phase = match report.completion {
+        DragCompletion::Confirmed | DragCompletion::Inferred => {
+            ExternalDragLifecyclePhase::Finished
+        }
+        DragCompletion::Failed(DragFailureKind::Cancelled) => ExternalDragLifecyclePhase::Cancelled,
+        DragCompletion::Failed(_) => ExternalDragLifecyclePhase::Failed,
+    };
+    emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(drag_id, phase));
+}
+
 pub(super) fn start_external_file_drag(
     window: DragWindow,
     payload: ExternalDragPayload,
@@ -79,6 +132,36 @@ pub(super) fn start_external_file_drag(
     thread::Builder::new()
         .name("audio-plugin-xdnd-file-drag".to_string())
         .spawn(move || {
+            let _active_drag = ActiveOutboundDrag::register(id);
+            if wayland_native::route_enabled() {
+                let route = DragBackendPlan::new(
+                    DragRoute::XwaylandToWaylandBridge,
+                    DragEndpointKind::XwaylandWindow,
+                    DragEndpointKind::WaylandSurface,
+                );
+                emit_backend_event(format!(
+                    "[dnd#{id}] Native Wayland worker started: serial-less start_drag route; {}",
+                    route.summary()
+                ));
+                match wayland_native::run_native_drag(id, paths.clone(), preview.clone()) {
+                    Ok(report) => {
+                        emit_backend_event(format!(
+                            "[dnd#{id}] Native Wayland drag {}: {}; {}",
+                            report.completion,
+                            report.summary(),
+                            report.stats_summary()
+                        ));
+                        emit_terminal_lifecycle(id, &report);
+                        return;
+                    }
+                    Err(err) => {
+                        emit_backend_event(format!(
+                            "[dnd#{id}] {err}; falling back to XDND source"
+                        ));
+                    }
+                }
+            }
+
             let route = DragBackendPlan::new(
                 DragRoute::XwaylandToXwayland,
                 DragEndpointKind::XwaylandWindow,
@@ -99,9 +182,14 @@ pub(super) fn start_external_file_drag(
                         report.summary(),
                         report.stats_summary()
                     ));
+                    emit_terminal_lifecycle(id, &report);
                 }
                 Err(err) => {
                     emit_backend_event(format!("[dnd#{id}] XDND failed: {err}"));
+                    emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+                        id,
+                        ExternalDragLifecyclePhase::Failed,
+                    ));
                 }
             }
         })
@@ -1537,9 +1625,8 @@ impl XdndSource {
             info!("XDND served data target atom={}", event.target);
             let payload = if event.target == self.atoms.x_special_gnome_copied_files {
                 self.file_payload.gnome_copied_files()
-            } else if event.target == self.atoms.text_plain {
-                &[][..]
             } else if event.target == self.atoms.text_plain_utf8
+                || event.target == self.atoms.text_plain
                 || event.target == self.atoms.utf8_string
                 || event.target == self.atoms.string
             {

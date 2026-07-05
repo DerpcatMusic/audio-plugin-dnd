@@ -21,6 +21,9 @@ use crate::{ExternalDragPayload, FileDragPayloadData};
 mod dnd;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 mod linux;
+
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+pub use linux::router::XdndDropRouter;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
@@ -103,6 +106,38 @@ pub struct BackendStart {
     pub backend: DragBackendKind,
     pub route: DragRoute,
     pub file_count: usize,
+}
+
+/// Backend drag lifecycle phase used by toolkit adapters to gate re-entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalDragLifecyclePhase {
+    Started,
+    DataRequested,
+    Dropped,
+    Finished,
+    Cancelled,
+    Failed,
+}
+
+impl ExternalDragLifecyclePhase {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Finished | Self::Cancelled | Self::Failed)
+    }
+}
+
+/// Typed backend drag lifecycle event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalDragLifecycleEvent {
+    pub drag_id: u64,
+    pub phase: ExternalDragLifecyclePhase,
+}
+
+impl ExternalDragLifecycleEvent {
+    #[must_use]
+    pub const fn new(drag_id: u64, phase: ExternalDragLifecyclePhase) -> Self {
+        Self { drag_id, phase }
+    }
 }
 
 /// Error returned by a native drag backend.
@@ -202,7 +237,17 @@ pub fn start_file_drag(
         file_payload.offer_count()
     ));
 
-    platform_start_file_drag(window, payload)?;
+    if let Err(err) = platform_start_file_drag(window, payload) {
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            drag_id,
+            ExternalDragLifecyclePhase::Failed,
+        ));
+        return Err(err);
+    }
+    emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+        drag_id,
+        ExternalDragLifecyclePhase::Started,
+    ));
 
     Ok(BackendStart {
         drag_id,
@@ -256,6 +301,11 @@ struct BackendEventBus {
     receiver: Mutex<Receiver<String>>,
 }
 
+struct BackendLifecycleBus {
+    sender: Sender<ExternalDragLifecycleEvent>,
+    receiver: Mutex<Receiver<ExternalDragLifecycleEvent>>,
+}
+
 fn backend_event_bus() -> &'static BackendEventBus {
     static BUS: OnceLock<BackendEventBus> = OnceLock::new();
     BUS.get_or_init(|| {
@@ -267,15 +317,44 @@ fn backend_event_bus() -> &'static BackendEventBus {
     })
 }
 
+fn backend_lifecycle_bus() -> &'static BackendLifecycleBus {
+    static BUS: OnceLock<BackendLifecycleBus> = OnceLock::new();
+    BUS.get_or_init(|| {
+        let (sender, receiver) = channel();
+        BackendLifecycleBus {
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    })
+}
+
 /// Emit a backend diagnostic event.
 pub fn emit_backend_event(message: impl Into<String>) {
     let _ = backend_event_bus().sender.send(message.into());
+}
+
+/// Emit a typed backend lifecycle event.
+pub fn emit_backend_lifecycle_event(event: ExternalDragLifecycleEvent) {
+    let _ = backend_lifecycle_bus().sender.send(event);
 }
 
 /// Drain backend diagnostic events.
 #[must_use]
 pub fn drain_backend_events() -> Vec<String> {
     let Ok(receiver) = backend_event_bus().receiver.lock() else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+/// Drain typed backend lifecycle events.
+#[must_use]
+pub fn drain_backend_lifecycle_events() -> Vec<ExternalDragLifecycleEvent> {
+    let Ok(receiver) = backend_lifecycle_bus().receiver.lock() else {
         return Vec::new();
     };
     let mut events = Vec::new();
@@ -320,5 +399,26 @@ mod tests {
         let err = start_file_drag(window, payload).expect_err("empty payload should fail");
 
         assert_eq!(err, ExternalDragError::EmptyPayload);
+    }
+
+    #[test]
+    fn lifecycle_bus_drains_typed_events_in_order() {
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            7,
+            ExternalDragLifecyclePhase::Started,
+        ));
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            7,
+            ExternalDragLifecyclePhase::Finished,
+        ));
+
+        assert_eq!(
+            drain_backend_lifecycle_events(),
+            vec![
+                ExternalDragLifecycleEvent::new(7, ExternalDragLifecyclePhase::Started),
+                ExternalDragLifecycleEvent::new(7, ExternalDragLifecyclePhase::Finished),
+            ]
+        );
+        assert!(drain_backend_lifecycle_events().is_empty());
     }
 }
