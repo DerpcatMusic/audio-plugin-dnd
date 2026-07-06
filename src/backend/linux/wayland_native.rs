@@ -48,6 +48,10 @@ use wayland_client::{
     },
     Connection, Dispatch, Proxy, QueueHandle,
 };
+use x11rb::connection::Connection as X11Connection;
+use x11rb::protocol::xproto::KeyButMask;
+use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::rust_connection::RustConnection;
 
 use super::portal;
 use crate::backend::dnd::{DragFailureKind, DragSessionReport, DragSessionStats};
@@ -211,10 +215,15 @@ pub(super) fn run_native_drag(
         .map_err(|err| NativeDragError::Unavailable(format!("event source: {err}")))?;
 
     let started = Instant::now();
+    let mut pointer_probe = PointerReleaseProbe::new();
     loop {
         event_loop
             .dispatch(Duration::from_millis(50), &mut state)
             .map_err(|err| NativeDragError::Unavailable(format!("dispatch: {err}")))?;
+
+        if pointer_probe.poll_released() {
+            state.evidence.note_pointer_released();
+        }
 
         let evidence = &state.evidence;
         if evidence.finished || evidence.cancelled {
@@ -227,7 +236,8 @@ pub(super) fn run_native_drag(
         {
             break;
         }
-        if evidence.send_requests > 0
+        if evidence.pointer_released
+            && evidence.send_requests > 0
             && evidence
                 .last_activity
                 .is_some_and(|at| at.elapsed() > POST_DROP_QUIET)
@@ -333,6 +343,7 @@ struct DragEvidence {
     send_requests: usize,
     post_drop_send_requests: usize,
     drop_performed: bool,
+    pointer_released: bool,
     finished: bool,
     cancelled: bool,
     last_activity: Option<Instant>,
@@ -346,6 +357,7 @@ impl DragEvidence {
             send_requests: 0,
             post_drop_send_requests: 0,
             drop_performed: false,
+            pointer_released: false,
             finished: false,
             cancelled: false,
             last_activity: None,
@@ -354,6 +366,14 @@ impl DragEvidence {
 
     fn touch(&mut self) {
         self.last_activity = Some(Instant::now());
+    }
+
+    fn note_pointer_released(&mut self) {
+        if self.pointer_released {
+            return;
+        }
+        self.pointer_released = true;
+        self.touch();
     }
 
     fn stats(&self) -> DragSessionStats {
@@ -382,13 +402,12 @@ impl DragEvidence {
                 "drop performed and target requested file data",
             );
         }
-        if self.send_requests > 0 {
+        if self.pointer_released && self.send_requests > 0 {
             // X11 targets fetch data through the compositor bridge after the
-            // compositor has already reset the drag, so no terminal source
-            // event arrives.
+            // physical button release, often without a terminal source event.
             return DragSessionReport::completed_inferred(
                 stats,
-                "target requested file data through the compositor bridge",
+                "target requested file data through the compositor bridge after release",
             );
         }
         if self.drop_performed {
@@ -425,6 +444,60 @@ struct NativeDragState {
 impl NativeDragState {
     fn log(&self, message: impl AsRef<str>) {
         emit_backend_event(format!("[dnd#{}] {}", self.drag_id, message.as_ref()));
+    }
+}
+
+struct PointerReleaseProbe {
+    conn: Option<RustConnection>,
+    root: x11rb::protocol::xproto::Window,
+    saw_primary_down: bool,
+    released: bool,
+}
+
+impl PointerReleaseProbe {
+    fn new() -> Self {
+        let Ok((conn, screen_num)) = RustConnection::connect(None) else {
+            return Self::unavailable();
+        };
+        let Some(screen) = conn.setup().roots.get(screen_num) else {
+            return Self::unavailable();
+        };
+        Self {
+            root: screen.root,
+            conn: Some(conn),
+            saw_primary_down: false,
+            released: false,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            conn: None,
+            root: x11rb::NONE,
+            saw_primary_down: false,
+            released: false,
+        }
+    }
+
+    fn poll_released(&mut self) -> bool {
+        if self.released {
+            return true;
+        }
+        let Some(conn) = self.conn.as_ref() else {
+            return false;
+        };
+        let Ok(cookie) = conn.query_pointer(self.root) else {
+            return false;
+        };
+        let Ok(pointer) = cookie.reply() else {
+            return false;
+        };
+        let primary_down = pointer.mask.contains(KeyButMask::BUTTON1);
+        self.saw_primary_down |= primary_down;
+        if self.saw_primary_down && !primary_down {
+            self.released = true;
+        }
+        self.released
     }
 }
 
@@ -857,8 +930,24 @@ mod tests {
             send_requests: 1,
             post_drop_send_requests: 1,
             drop_performed: true,
+            pointer_released: true,
             ..DragEvidence::new()
         }
+    }
+
+    #[test]
+    fn hover_data_before_release_is_not_bridge_success() {
+        let evidence = DragEvidence {
+            target_interacted: true,
+            send_requests: 1,
+            post_drop_send_requests: 0,
+            ..DragEvidence::new()
+        };
+        let report = evidence.into_report();
+        assert!(matches!(
+            report.completion,
+            crate::backend::dnd::DragCompletion::Failed(_)
+        ));
     }
 
     #[test]

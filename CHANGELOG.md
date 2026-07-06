@@ -4,6 +4,11 @@ Concise public-facing release notes. Keep entries newest-first. Use `## x.y.z - 
 
 ## Unreleased
 
+## 0.1.8 - 2026-07-06
+
+- Fixed fast native Wayland drags failing after hover-only data requests by waiting for the physical mouse release before treating bridge transfers as complete.
+- Fixed overlapping native drag sessions by keeping GUI drag state in flight until the backend reports a terminal result.
+
 ## 0.1.7 - 2026-07-06
 
 - Fixed Hyprland crashes after drops into X11 targets by keeping the native Wayland drag client connected until the compositor bridge finishes cleanup.
