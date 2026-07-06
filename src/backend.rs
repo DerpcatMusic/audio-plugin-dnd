@@ -114,6 +114,7 @@ pub enum ExternalDragLifecyclePhase {
     Started,
     DataRequested,
     Dropped,
+    Lingering,
     Finished,
     Cancelled,
     Failed,

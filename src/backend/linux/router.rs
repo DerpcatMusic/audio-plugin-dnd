@@ -241,7 +241,9 @@ impl RouterWorker {
     }
 
     fn run(mut self, running: &AtomicBool) {
-        self.claim_proxy_if_available();
+        if !super::has_active_outbound_drag() {
+            self.claim_proxy_if_available();
+        }
         emit_backend_event(format!(
             "[dnd-router] installed: router=0x{:x}, toplevel=0x{:x}, claimed={}",
             self.router_window, self.toplevel, self.claimed
@@ -265,7 +267,9 @@ impl RouterWorker {
                             );
                             break;
                         }
-                        self.claim_proxy_if_available();
+                        if !super::has_active_outbound_drag() {
+                            self.claim_proxy_if_available();
+                        }
                     }
                     thread::sleep(POLL_SLEEP);
                 }

@@ -72,6 +72,9 @@ const POST_DROP_QUIET: Duration = Duration::from_millis(1500);
 /// Keep the native Wayland client connected after a bridged X11 drop so
 /// Hyprland's Wayland-to-X11 cleanup can finish before `wl_client_destroy`.
 const BRIDGE_LINGER_TIMEOUT: Duration = Duration::from_secs(4);
+/// After pointer release with weak bridge evidence, keep dispatching for
+/// more compositor events before treating the session as failed.
+const POST_RELEASE_BRIDGE_WAIT: Duration = Duration::from_secs(4);
 /// A cancellation this early, with zero target interaction, means the
 /// compositor refused the serial-less drag rather than the user missing.
 const EARLY_REJECT_WINDOW: Duration = Duration::from_millis(1000);
@@ -216,6 +219,7 @@ pub(super) fn run_native_drag(
 
     let started = Instant::now();
     let mut pointer_probe = PointerReleaseProbe::new();
+    let mut pointer_release_at: Option<Instant> = None;
     loop {
         event_loop
             .dispatch(Duration::from_millis(50), &mut state)
@@ -223,6 +227,7 @@ pub(super) fn run_native_drag(
 
         if pointer_probe.poll_released() {
             state.evidence.note_pointer_released();
+            pointer_release_at.get_or_insert_with(Instant::now);
         }
 
         let evidence = &state.evidence;
@@ -236,11 +241,18 @@ pub(super) fn run_native_drag(
         {
             break;
         }
-        if evidence.pointer_released
-            && evidence.send_requests > 0
+        if bridge_transfer_ready(evidence)
+            && evidence.pointer_released
             && evidence
                 .last_activity
                 .is_some_and(|at| at.elapsed() > POST_DROP_QUIET)
+        {
+            break;
+        }
+        if evidence.pointer_released
+            && !bridge_transfer_ready(evidence)
+            && pointer_release_at
+                .is_some_and(|at| at.elapsed() > POST_RELEASE_BRIDGE_WAIT)
         {
             break;
         }
@@ -274,12 +286,27 @@ pub(super) fn run_native_drag(
     Ok(report)
 }
 
+/// True when the compositor bridge has enough evidence to treat the transfer
+/// as complete (or terminal events already arrived).
+fn bridge_transfer_ready(evidence: &DragEvidence) -> bool {
+    if evidence.finished || evidence.drop_performed {
+        return true;
+    }
+    evidence.pointer_released
+        && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
+}
+
 /// True when the compositor bridge may still hold drag state after we inferred
 /// success but never delivered a terminal `dnd_finished` event.
 fn needs_bridge_linger(evidence: &DragEvidence) -> bool {
-    !evidence.finished
-        && !evidence.cancelled
-        && (evidence.send_requests > 0 || evidence.drop_performed)
+    if evidence.finished || evidence.cancelled {
+        return false;
+    }
+    if evidence.drop_performed {
+        return true;
+    }
+    evidence.pointer_released
+        && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
 }
 
 fn linger_and_teardown(
@@ -288,6 +315,10 @@ fn linger_and_teardown(
     mut event_loop: EventLoop<'_, NativeDragState>,
     state: &mut NativeDragState,
 ) {
+    emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+        drag_id,
+        ExternalDragLifecyclePhase::Lingering,
+    ));
     emit_backend_event(format!(
         "[dnd#{drag_id}] Native Wayland bridge linger started (up to {}ms)",
         BRIDGE_LINGER_TIMEOUT.as_millis()
@@ -341,6 +372,7 @@ struct DragEvidence {
     target_interacted: bool,
     accepted_mime: Option<String>,
     send_requests: usize,
+    accept_mime_events: usize,
     post_drop_send_requests: usize,
     drop_performed: bool,
     pointer_released: bool,
@@ -355,6 +387,7 @@ impl DragEvidence {
             target_interacted: false,
             accepted_mime: None,
             send_requests: 0,
+            accept_mime_events: 0,
             post_drop_send_requests: 0,
             drop_performed: false,
             pointer_released: false,
@@ -402,7 +435,10 @@ impl DragEvidence {
                 "drop performed and target requested file data",
             );
         }
-        if self.pointer_released && self.send_requests > 0 {
+        if self.pointer_released
+            && self.send_requests > 0
+            && (self.send_requests >= 2 || self.accept_mime_events >= 1)
+        {
             // X11 targets fetch data through the compositor bridge after the
             // physical button release, often without a terminal source event.
             return DragSessionReport::completed_inferred(
@@ -825,6 +861,7 @@ impl DataSourceHandler for NativeDragState {
         mime: Option<String>,
     ) {
         self.evidence.target_interacted = true;
+        self.evidence.accept_mime_events += 1;
         self.evidence.touch();
         if let Some(mime) = &mime {
             if self.evidence.accepted_mime.as_deref() != Some(mime.as_str()) {
@@ -948,11 +985,67 @@ mod tests {
             report.completion,
             crate::backend::dnd::DragCompletion::Failed(_)
         ));
+        assert!(!bridge_transfer_ready(&DragEvidence {
+            target_interacted: true,
+            send_requests: 1,
+            ..DragEvidence::new()
+        }));
+    }
+
+    #[test]
+    fn single_hover_probe_after_release_is_not_success() {
+        let evidence = DragEvidence {
+            target_interacted: true,
+            send_requests: 1,
+            pointer_released: true,
+            ..DragEvidence::new()
+        };
+        assert!(!bridge_transfer_ready(&evidence));
+        let report = evidence.into_report();
+        assert!(matches!(
+            report.completion,
+            crate::backend::dnd::DragCompletion::Failed(
+                crate::backend::dnd::DragFailureKind::TargetNoData
+            )
+        ));
+    }
+
+    #[test]
+    fn bridge_transfer_ready_for_strong_post_release_evidence() {
+        let evidence = DragEvidence {
+            send_requests: 2,
+            pointer_released: true,
+            ..DragEvidence::new()
+        };
+        assert!(bridge_transfer_ready(&evidence));
+        let report = evidence.into_report();
+        assert!(report.is_success());
+    }
+
+    #[test]
+    fn bridge_transfer_ready_when_mime_accepted() {
+        let evidence = DragEvidence {
+            send_requests: 1,
+            accept_mime_events: 1,
+            pointer_released: true,
+            ..DragEvidence::new()
+        };
+        assert!(bridge_transfer_ready(&evidence));
     }
 
     #[test]
     fn bridge_linger_needed_for_inferred_bridge_success() {
         assert!(needs_bridge_linger(&bridge_drop_evidence()));
+    }
+
+    #[test]
+    fn bridge_linger_not_needed_for_weak_probe() {
+        let evidence = DragEvidence {
+            send_requests: 1,
+            pointer_released: true,
+            ..DragEvidence::new()
+        };
+        assert!(!needs_bridge_linger(&evidence));
     }
 
     #[test]

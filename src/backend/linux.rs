@@ -61,6 +61,11 @@ fn active_outbound_drags() -> &'static Mutex<HashSet<u64>> {
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn outbound_drag_mutex() -> &'static Mutex<()> {
+    static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    MUTEX.get_or_init(|| Mutex::new(()))
+}
+
 struct ActiveOutboundDrag {
     id: u64,
 }
@@ -133,6 +138,9 @@ pub(super) fn start_external_file_drag(
         .name("audio-plugin-xdnd-file-drag".to_string())
         .spawn(move || {
             let _active_drag = ActiveOutboundDrag::register(id);
+            let _drag_lock = outbound_drag_mutex()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if wayland_native::route_enabled() {
                 let route = DragBackendPlan::new(
                     DragRoute::XwaylandToWaylandBridge,
@@ -144,7 +152,7 @@ pub(super) fn start_external_file_drag(
                     route.summary()
                 ));
                 match wayland_native::run_native_drag(id, paths.clone(), preview.clone()) {
-                    Ok(report) => {
+                    Ok(report) if report.is_success() => {
                         emit_backend_event(format!(
                             "[dnd#{id}] Native Wayland drag {}: {}; {}",
                             report.completion,
@@ -153,6 +161,14 @@ pub(super) fn start_external_file_drag(
                         ));
                         emit_terminal_lifecycle(id, &report);
                         return;
+                    }
+                    Ok(report) => {
+                        emit_backend_event(format!(
+                            "[dnd#{id}] Native Wayland drag {} (weak/failed): {}; {}; falling back to XDND source",
+                            report.completion,
+                            report.summary(),
+                            report.stats_summary()
+                        ));
                     }
                     Err(err) => {
                         emit_backend_event(format!(
