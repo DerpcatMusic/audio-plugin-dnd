@@ -65,6 +65,9 @@ use crate::{ExternalDragPreview, FileDragPayloadData};
 const SESSION_DEADLINE: Duration = Duration::from_secs(120);
 /// Idle grace after a drop before inferring the outcome from the evidence.
 const POST_DROP_QUIET: Duration = Duration::from_millis(1500);
+/// Keep the native Wayland client connected after a bridged X11 drop so
+/// Hyprland's Wayland-to-X11 cleanup can finish before `wl_client_destroy`.
+const BRIDGE_LINGER_TIMEOUT: Duration = Duration::from_secs(4);
 /// A cancellation this early, with zero target interaction, means the
 /// compositor refused the serial-less drag rather than the user missing.
 const EARLY_REJECT_WINDOW: Duration = Duration::from_millis(1000);
@@ -197,6 +200,7 @@ pub(super) fn run_native_drag(
         shm,
         active: Some(active),
         _icon: icon,
+        _origin_surface: origin_surface,
         evidence: DragEvidence::new(),
     };
 
@@ -235,23 +239,94 @@ pub(super) fn run_native_drag(
         }
     }
 
-    let evidence = state.evidence;
-    if evidence.cancelled
-        && !evidence.drop_performed
-        && !evidence.target_interacted
-        && evidence.send_requests == 0
+    if state.evidence.cancelled
+        && !state.evidence.drop_performed
+        && !state.evidence.target_interacted
+        && state.evidence.send_requests == 0
         && started.elapsed() < EARLY_REJECT_WINDOW
     {
+        teardown_native_session(drag_id, &connection, &mut state);
         return Err(NativeDragError::Rejected(format!(
             "cancelled {}ms after start with no target interaction",
             started.elapsed().as_millis()
         )));
     }
 
-    Ok(evidence.into_report())
+    let linger = needs_bridge_linger(&state.evidence);
+    let report = state.evidence.clone().into_report();
+
+    if linger {
+        linger_and_teardown(drag_id, connection, event_loop, &mut state);
+    } else {
+        teardown_native_session(drag_id, &connection, &mut state);
+    }
+
+    Ok(report)
 }
 
-#[derive(Debug)]
+/// True when the compositor bridge may still hold drag state after we inferred
+/// success but never delivered a terminal `dnd_finished` event.
+fn needs_bridge_linger(evidence: &DragEvidence) -> bool {
+    !evidence.finished
+        && !evidence.cancelled
+        && (evidence.send_requests > 0 || evidence.drop_performed)
+}
+
+fn linger_and_teardown(
+    drag_id: u64,
+    connection: Connection,
+    mut event_loop: EventLoop<'_, NativeDragState>,
+    state: &mut NativeDragState,
+) {
+    emit_backend_event(format!(
+        "[dnd#{drag_id}] Native Wayland bridge linger started (up to {}ms)",
+        BRIDGE_LINGER_TIMEOUT.as_millis()
+    ));
+    let deadline = Instant::now() + BRIDGE_LINGER_TIMEOUT;
+    while Instant::now() < deadline {
+        if state.evidence.finished || state.evidence.cancelled {
+            break;
+        }
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(50));
+        if event_loop.dispatch(timeout, state).is_err() {
+            break;
+        }
+    }
+    let reason = if state.evidence.finished {
+        "dnd_finished"
+    } else if state.evidence.cancelled {
+        "cancelled"
+    } else {
+        "grace_timeout"
+    };
+    emit_backend_event(format!(
+        "[dnd#{drag_id}] Native Wayland bridge linger ending: {reason}"
+    ));
+    teardown_native_session(drag_id, &connection, state);
+}
+
+fn teardown_native_session(
+    drag_id: u64,
+    connection: &Connection,
+    state: &mut NativeDragState,
+) {
+    state._icon = None;
+    if let Some(active) = state.active.take() {
+        active.destroy();
+    }
+    if let Err(err) = connection.flush() {
+        emit_backend_event(format!(
+            "[dnd#{drag_id}] Native Wayland session flush failed: {err}"
+        ));
+    }
+    emit_backend_event(format!(
+        "[dnd#{drag_id}] Native Wayland session disconnected"
+    ));
+}
+
+#[derive(Debug, Clone)]
 struct DragEvidence {
     target_interacted: bool,
     accepted_mime: Option<String>,
@@ -343,6 +418,7 @@ struct NativeDragState {
     shm: Shm,
     active: Option<ActiveWaylandDrag>,
     _icon: Option<NativeDragIcon>,
+    _origin_surface: WlSurface,
     evidence: DragEvidence,
 }
 
@@ -770,3 +846,42 @@ impl DataSourceHandler for NativeDragState {
 delegate_seat!(NativeDragState);
 delegate_data_device!(NativeDragState);
 delegate_shm!(NativeDragState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bridge_drop_evidence() -> DragEvidence {
+        DragEvidence {
+            target_interacted: true,
+            send_requests: 1,
+            post_drop_send_requests: 1,
+            drop_performed: true,
+            ..DragEvidence::new()
+        }
+    }
+
+    #[test]
+    fn bridge_linger_needed_for_inferred_bridge_success() {
+        assert!(needs_bridge_linger(&bridge_drop_evidence()));
+    }
+
+    #[test]
+    fn bridge_linger_not_needed_after_dnd_finished() {
+        let mut evidence = bridge_drop_evidence();
+        evidence.finished = true;
+        assert!(!needs_bridge_linger(&evidence));
+    }
+
+    #[test]
+    fn bridge_linger_not_needed_after_cancel() {
+        let mut evidence = bridge_drop_evidence();
+        evidence.cancelled = true;
+        assert!(!needs_bridge_linger(&evidence));
+    }
+
+    #[test]
+    fn bridge_linger_not_needed_without_bridge_activity() {
+        assert!(!needs_bridge_linger(&DragEvidence::new()));
+    }
+}

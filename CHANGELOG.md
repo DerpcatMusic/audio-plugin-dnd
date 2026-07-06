@@ -4,6 +4,10 @@ Concise public-facing release notes. Keep entries newest-first. Use `## x.y.z - 
 
 ## Unreleased
 
+## 0.1.7 - 2026-07-06
+
+- Fixed Hyprland crashes after drops into X11 targets by keeping the native Wayland drag client connected until the compositor bridge finishes cleanup.
+
 ## 0.1.6 - 2026-07-06
 
 - Added native Wayland drag icons for preview-capable drag payloads.
