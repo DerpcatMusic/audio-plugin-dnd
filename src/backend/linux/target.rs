@@ -1,3 +1,5 @@
+//! XDND target tracking helpers.
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct RecentRealTarget;
 

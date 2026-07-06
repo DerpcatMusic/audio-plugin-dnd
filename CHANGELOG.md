@@ -4,6 +4,43 @@ Concise public-facing release notes. Keep entries newest-first. Use `## x.y.z - 
 
 ## Unreleased
 
+## 0.1.16 - 2026-07-06
+
+- Fixed premature native Wayland handoff when dragging from an XWayland plugin editor on Hyprland; XDND now stays active over the host and Bitwig until the pointer actually leaves the plugin window.
+- Native handoff to Wayland apps such as Discord still triggers after you cross off the plugin UI onto an anonymous XWayland bridge.
+
+## 0.1.15 - 2026-07-06
+
+- Outbound drags now start with XDND immediately and switch to native Wayland delivery when the pointer settles over a native app, so crossing an X11 host on the way to Discord or Vesktop no longer locks the wrong route.
+- Removed preflight pointer polling that could commit to XDND before you reached your real drop target.
+
+## 0.1.14 - 2026-07-06
+
+- Preflight no longer early-exits on unclassified targets while the pointer is still over the host window, so outbound drags do not start the native Wayland route prematurely.
+- Drop-target classification now searches XdndAware descendants, so X11 hosts such as Bitwig are recognized even when the toplevel leaf is not XdndAware.
+- Unclassified external targets from XWayland editors route straight to XDND instead of native-first.
+
+## 0.1.13 - 2026-07-06
+
+- Outbound drags now classify the drop target at pointer release (or stable external hover) instead of at drag start, so X11 hosts and native Wayland apps each get the correct delivery route.
+- Reverted the always-XDND shortcut for XWayland editors; routing again follows the classified target under the cursor.
+- Drops released back over the plugin UI cancel cleanly without starting a backend worker.
+
+## 0.1.12 - 2026-07-06
+
+- Outbound file drags from embedded XWayland plugin editors now always use XDND instead of trying native Wayland first, so drops into Bitwig and other X11 hosts no longer stall when the drag starts over the plugin UI.
+- Registered plugin editor windows under the pointer are classified as plugin-owned targets for clearer routing logs.
+
+## 0.1.11 - 2026-07-06
+
+- Outbound drags now pick XDND or native Wayland based on the window under the pointer, so drops into X11 hosts such as Bitwig skip the native bridge attempt.
+- Plugin editor windows register on open so outbound drags no longer treat floating panels as drop targets.
+
+## 0.1.10 - 2026-07-06
+
+- Fixed drag lifecycle events being lost when multiple plugin windows drain the shared event bus so each drag id now has its own routable terminal state.
+- Added per-drag worker tracking so GUI adapters can clear in-flight state as soon as the backend worker exits instead of waiting for a 30-second watchdog.
+
 ## 0.1.9 - 2026-07-06
 
 - Fixed drag-and-drop breaking after dropping into Bitwig on Hyprland by requiring stronger bridge evidence before treating a transfer as complete and falling back to XDND when a native session only saw a hover probe.

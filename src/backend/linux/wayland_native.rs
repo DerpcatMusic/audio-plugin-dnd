@@ -49,8 +49,8 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
 };
 use x11rb::connection::Connection as X11Connection;
-use x11rb::protocol::xproto::KeyButMask;
 use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::protocol::xproto::KeyButMask;
 use x11rb::rust_connection::RustConnection;
 
 use super::portal;
@@ -130,8 +130,7 @@ pub(super) fn run_native_drag(
     paths: Vec<PathBuf>,
     preview: Option<ExternalDragPreview>,
 ) -> Result<DragSessionReport, NativeDragError> {
-    let payload =
-        FileDragPayloadData::new(paths.clone()).map_err(|err| NativeDragError::Unavailable(err))?;
+    let payload = FileDragPayloadData::new(paths.clone()).map_err(NativeDragError::Unavailable)?;
 
     let mut offers = Vec::new();
     match portal::start_file_transfer(&paths) {
@@ -251,8 +250,7 @@ pub(super) fn run_native_drag(
         }
         if evidence.pointer_released
             && !bridge_transfer_ready(evidence)
-            && pointer_release_at
-                .is_some_and(|at| at.elapsed() > POST_RELEASE_BRIDGE_WAIT)
+            && pointer_release_at.is_some_and(|at| at.elapsed() > POST_RELEASE_BRIDGE_WAIT)
         {
             break;
         }
@@ -292,8 +290,7 @@ fn bridge_transfer_ready(evidence: &DragEvidence) -> bool {
     if evidence.finished || evidence.drop_performed {
         return true;
     }
-    evidence.pointer_released
-        && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
+    evidence.pointer_released && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
 }
 
 /// True when the compositor bridge may still hold drag state after we inferred
@@ -305,8 +302,7 @@ fn needs_bridge_linger(evidence: &DragEvidence) -> bool {
     if evidence.drop_performed {
         return true;
     }
-    evidence.pointer_released
-        && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
+    evidence.pointer_released && (evidence.send_requests >= 2 || evidence.accept_mime_events >= 1)
 }
 
 fn linger_and_teardown(
@@ -348,11 +344,7 @@ fn linger_and_teardown(
     teardown_native_session(drag_id, &connection, state);
 }
 
-fn teardown_native_session(
-    drag_id: u64,
-    connection: &Connection,
-    state: &mut NativeDragState,
-) {
+fn teardown_native_session(drag_id: u64, connection: &Connection, state: &mut NativeDragState) {
     state._icon = None;
     if let Some(active) = state.active.take() {
         active.destroy();
@@ -696,6 +688,7 @@ fn spectral_color(value: f32) -> [u8; 4] {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_rect(
     canvas: &mut [u8],
     width: usize,
@@ -917,7 +910,7 @@ impl DataSourceHandler for NativeDragState {
     fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
         self.evidence.drop_performed = true;
         self.evidence.touch();
-        self.log("Native drag drop performed".to_string());
+        self.log("Native drag drop performed");
         emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
             self.drag_id,
             ExternalDragLifecyclePhase::Dropped,

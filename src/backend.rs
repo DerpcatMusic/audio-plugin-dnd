@@ -5,6 +5,7 @@
 //! toolkit, so baseview, winit, Vizia, Slint, or custom plugin wrappers can all
 //! feed the same drag protocol.
 
+use std::collections::HashMap;
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
     Mutex, OnceLock,
@@ -22,6 +23,8 @@ mod dnd;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 mod linux;
 
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+pub use linux::plugin_windows::PluginWindowGuard;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
 pub use linux::router::XdndDropRouter;
 #[cfg(target_os = "macos")]
@@ -307,6 +310,17 @@ struct BackendLifecycleBus {
     receiver: Mutex<Receiver<ExternalDragLifecycleEvent>>,
 }
 
+struct RoutedDragLifecycle {
+    phases: Mutex<HashMap<u64, ExternalDragLifecyclePhase>>,
+}
+
+fn routed_drag_lifecycle() -> &'static RoutedDragLifecycle {
+    static ROUTED: OnceLock<RoutedDragLifecycle> = OnceLock::new();
+    ROUTED.get_or_init(|| RoutedDragLifecycle {
+        phases: Mutex::new(HashMap::new()),
+    })
+}
+
 fn backend_event_bus() -> &'static BackendEventBus {
     static BUS: OnceLock<BackendEventBus> = OnceLock::new();
     BUS.get_or_init(|| {
@@ -336,7 +350,55 @@ pub fn emit_backend_event(message: impl Into<String>) {
 
 /// Emit a typed backend lifecycle event.
 pub fn emit_backend_lifecycle_event(event: ExternalDragLifecycleEvent) {
+    if event.phase.is_terminal() || event.phase == ExternalDragLifecyclePhase::Lingering {
+        if let Ok(mut phases) = routed_drag_lifecycle().phases.lock() {
+            phases.insert(event.drag_id, event.phase);
+        }
+    }
     let _ = backend_lifecycle_bus().sender.send(event);
+}
+
+/// Remove and return a routed terminal or lingering lifecycle phase for one drag id.
+///
+/// Unlike [`drain_backend_lifecycle_events`], this cannot be stolen by another window
+/// that does not own the drag id.
+#[must_use]
+pub fn take_drag_terminal(drag_id: u64) -> Option<ExternalDragLifecyclePhase> {
+    let Ok(mut phases) = routed_drag_lifecycle().phases.lock() else {
+        return None;
+    };
+    match phases.get(&drag_id) {
+        Some(phase) if phase.is_terminal() || *phase == ExternalDragLifecyclePhase::Lingering => {
+            phases.remove(&drag_id)
+        }
+        _ => None,
+    }
+}
+
+/// True when a routed terminal or lingering lifecycle phase is waiting for `drag_id`.
+#[must_use]
+pub fn has_routed_drag_lifecycle(drag_id: u64) -> bool {
+    routed_drag_lifecycle()
+        .phases
+        .lock()
+        .ok()
+        .is_some_and(|phases| phases.contains_key(&drag_id))
+}
+
+/// True while the platform backend still has an outbound drag worker for `drag_id`.
+#[must_use]
+pub fn is_drag_active(drag_id: u64) -> bool {
+    platform_is_drag_active(drag_id)
+}
+
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+fn platform_is_drag_active(drag_id: u64) -> bool {
+    linux::is_drag_active(drag_id)
+}
+
+#[cfg(not(all(target_family = "unix", not(target_os = "macos"))))]
+fn platform_is_drag_active(_drag_id: u64) -> bool {
+    false
 }
 
 /// Drain backend diagnostic events.
@@ -400,6 +462,51 @@ mod tests {
         let err = start_file_drag(window, payload).expect_err("empty payload should fail");
 
         assert_eq!(err, ExternalDragError::EmptyPayload);
+    }
+
+    #[test]
+    fn routed_terminal_survives_competing_bus_drain() {
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            11,
+            ExternalDragLifecyclePhase::Finished,
+        ));
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            22,
+            ExternalDragLifecyclePhase::Cancelled,
+        ));
+
+        assert_eq!(
+            drain_backend_lifecycle_events(),
+            vec![
+                ExternalDragLifecycleEvent::new(11, ExternalDragLifecyclePhase::Finished),
+                ExternalDragLifecycleEvent::new(22, ExternalDragLifecyclePhase::Cancelled),
+            ]
+        );
+
+        assert_eq!(
+            take_drag_terminal(11),
+            Some(ExternalDragLifecyclePhase::Finished)
+        );
+        assert_eq!(
+            take_drag_terminal(22),
+            Some(ExternalDragLifecyclePhase::Cancelled)
+        );
+        assert_eq!(take_drag_terminal(11), None);
+    }
+
+    #[test]
+    fn take_drag_terminal_is_consume_once() {
+        emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+            5,
+            ExternalDragLifecyclePhase::Failed,
+        ));
+
+        assert_eq!(
+            take_drag_terminal(5),
+            Some(ExternalDragLifecyclePhase::Failed)
+        );
+        assert_eq!(take_drag_terminal(5), None);
+        assert!(!has_routed_drag_lifecycle(5));
     }
 
     #[test]

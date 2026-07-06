@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod mime;
+pub mod plugin_windows;
 mod portal;
 pub(super) mod router;
 mod target;
@@ -55,6 +56,98 @@ const STATUS_ACCEPT: u32 = 1;
 const DROP_FINISH_WAIT: Duration = Duration::from_millis(260);
 const DROP_READY_FINISH_WAIT: Duration = Duration::from_millis(180);
 const DROP_SELECTION_GRACE: Duration = Duration::from_millis(80);
+const BRIDGE_HANDOFF_STREAK: u32 = 2;
+
+/// Outcome of an XDND source session.
+enum XdndOutcome {
+    Completed(DragSessionReport),
+    HandoffToNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeHandoffDecision {
+    Handoff,
+    SuppressedStillOverOrigin,
+    SuppressedNotLeftOrigin,
+    SuppressedRealXdndTarget,
+    SuppressedStreakInsufficient,
+    SuppressedNotOverBridge,
+    SuppressedRouteDisabled,
+    SuppressedButtonReleased,
+}
+
+impl BridgeHandoffDecision {
+    fn suppression_log(self) -> Option<&'static str> {
+        match self {
+            Self::SuppressedStillOverOrigin => Some("handoff suppressed: still over origin"),
+            Self::SuppressedNotLeftOrigin => Some("handoff suppressed: pointer has not left origin"),
+            Self::SuppressedRealXdndTarget => Some("handoff suppressed: real X11 Xdnd target"),
+            Self::SuppressedStreakInsufficient
+            | Self::SuppressedNotOverBridge
+            | Self::SuppressedRouteDisabled
+            | Self::SuppressedButtonReleased
+            | Self::Handoff => None,
+        }
+    }
+}
+
+#[must_use]
+fn bridge_hover_streak_after_sample(
+    streak: u32,
+    route_enabled: bool,
+    over_bridge: bool,
+    button1_held: bool,
+    over_origin: bool,
+    is_real_target: bool,
+    saw_pointer_leave_origin: bool,
+) -> u32 {
+    if route_enabled
+        && over_bridge
+        && button1_held
+        && !over_origin
+        && !is_real_target
+        && saw_pointer_leave_origin
+    {
+        streak.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+#[must_use]
+fn evaluate_bridge_handoff(
+    streak: u32,
+    route_enabled: bool,
+    over_bridge: bool,
+    button1_held: bool,
+    over_origin: bool,
+    saw_pointer_leave_origin: bool,
+    is_real_target: bool,
+) -> BridgeHandoffDecision {
+    if !route_enabled {
+        return BridgeHandoffDecision::SuppressedRouteDisabled;
+    }
+    if !button1_held {
+        return BridgeHandoffDecision::SuppressedButtonReleased;
+    }
+    if over_origin {
+        return BridgeHandoffDecision::SuppressedStillOverOrigin;
+    }
+    if !saw_pointer_leave_origin {
+        return BridgeHandoffDecision::SuppressedNotLeftOrigin;
+    }
+    if is_real_target {
+        return BridgeHandoffDecision::SuppressedRealXdndTarget;
+    }
+    if !over_bridge {
+        return BridgeHandoffDecision::SuppressedNotOverBridge;
+    }
+    if streak >= BRIDGE_HANDOFF_STREAK {
+        BridgeHandoffDecision::Handoff
+    } else {
+        BridgeHandoffDecision::SuppressedStreakInsufficient
+    }
+}
 
 fn active_outbound_drags() -> &'static Mutex<HashSet<u64>> {
     static ACTIVE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
@@ -91,6 +184,13 @@ pub(super) fn has_active_outbound_drag() -> bool {
     active_outbound_drags()
         .lock()
         .map(|active| !active.is_empty())
+        .unwrap_or(false)
+}
+
+pub(super) fn is_drag_active(drag_id: u64) -> bool {
+    active_outbound_drags()
+        .lock()
+        .map(|active| active.contains(&drag_id))
         .unwrap_or(false)
 }
 
@@ -141,42 +241,9 @@ pub(super) fn start_external_file_drag(
             let _drag_lock = outbound_drag_mutex()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if wayland_native::route_enabled() {
-                let route = DragBackendPlan::new(
-                    DragRoute::XwaylandToWaylandBridge,
-                    DragEndpointKind::XwaylandWindow,
-                    DragEndpointKind::WaylandSurface,
-                );
-                emit_backend_event(format!(
-                    "[dnd#{id}] Native Wayland worker started: serial-less start_drag route; {}",
-                    route.summary()
-                ));
-                match wayland_native::run_native_drag(id, paths.clone(), preview.clone()) {
-                    Ok(report) if report.is_success() => {
-                        emit_backend_event(format!(
-                            "[dnd#{id}] Native Wayland drag {}: {}; {}",
-                            report.completion,
-                            report.summary(),
-                            report.stats_summary()
-                        ));
-                        emit_terminal_lifecycle(id, &report);
-                        return;
-                    }
-                    Ok(report) => {
-                        emit_backend_event(format!(
-                            "[dnd#{id}] Native Wayland drag {} (weak/failed): {}; {}; falling back to XDND source",
-                            report.completion,
-                            report.summary(),
-                            report.stats_summary()
-                        ));
-                    }
-                    Err(err) => {
-                        emit_backend_event(format!(
-                            "[dnd#{id}] {err}; falling back to XDND source"
-                        ));
-                    }
-                }
-            }
+
+            let paths_for_handoff = paths.clone();
+            let preview_for_handoff = preview.clone();
 
             let route = DragBackendPlan::new(
                 DragRoute::XwaylandToXwayland,
@@ -191,7 +258,39 @@ pub(super) fn start_external_file_drag(
                 route.summary()
             ));
             match XdndSource::new(id, paths, preview, origin_window).and_then(XdndSource::run) {
-                Ok(report) => {
+                Ok(XdndOutcome::HandoffToNative) => {
+                    let route = DragBackendPlan::new(
+                        DragRoute::XwaylandToWaylandBridge,
+                        DragEndpointKind::XwaylandWindow,
+                        DragEndpointKind::WaylandSurface,
+                    );
+                    emit_backend_event(format!(
+                        "[dnd#{id}] Native Wayland worker started after XDND handoff; {}",
+                        route.summary()
+                    ));
+                    match wayland_native::run_native_drag(id, paths_for_handoff, preview_for_handoff)
+                    {
+                        Ok(report) => {
+                            emit_backend_event(format!(
+                                "[dnd#{id}] Native Wayland drag {}: {}; {}",
+                                report.completion,
+                                report.summary(),
+                                report.stats_summary()
+                            ));
+                            emit_terminal_lifecycle(id, &report);
+                        }
+                        Err(err) => {
+                            emit_backend_event(format!(
+                                "[dnd#{id}] Native Wayland drag failed after handoff: {err}"
+                            ));
+                            emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+                                id,
+                                ExternalDragLifecyclePhase::Failed,
+                            ));
+                        }
+                    }
+                }
+                Ok(XdndOutcome::Completed(report)) => {
                     emit_backend_event(format!(
                         "[dnd#{id}] XDND {}: {}; {}",
                         report.completion,
@@ -955,6 +1054,10 @@ struct XdndSource {
     data_requests: usize,
     logged_data_request: bool,
     preview: Option<PreviewWindow>,
+    bridge_hover_streak: u32,
+    saw_pointer_leave_origin: bool,
+    logged_handoff_suppressed_origin: bool,
+    handoff_performed: bool,
 }
 
 impl XdndSource {
@@ -1059,7 +1162,7 @@ impl XdndSource {
             last_real_target: None,
             last_real_data_target: None,
             last_real_accepted_target: None,
-            recent_real_target: RecentRealTarget::default(),
+            recent_real_target: RecentRealTarget,
             last_logged_accept: None,
             drop_target: None,
             drop_target_data_requests: 0,
@@ -1068,6 +1171,10 @@ impl XdndSource {
             data_requests: 0,
             logged_data_request: false,
             preview,
+            bridge_hover_streak: 0,
+            saw_pointer_leave_origin: false,
+            logged_handoff_suppressed_origin: false,
+            handoff_performed: false,
         })
     }
 
@@ -1108,13 +1215,16 @@ impl XdndSource {
         }
     }
 
-    fn run(mut self) -> Result<DragSessionReport, String> {
+    fn run(mut self) -> Result<XdndOutcome, String> {
         self.log(format!(
             "{} via {}",
             DragPhase::Started.summary(),
             DragTargetKind::RealXWindow.summary()
         ));
         self.update_target_from_pointer()?;
+        if self.handoff_performed {
+            return Ok(XdndOutcome::HandoffToNative);
+        }
         let deadline = Instant::now() + Duration::from_secs(6);
         let mut finish_deadline = None;
         let mut waiting_for_finished = false;
@@ -1123,6 +1233,9 @@ impl XdndSource {
         let mut sent_drop = false;
 
         loop {
+            if self.handoff_performed {
+                return Ok(XdndOutcome::HandoffToNative);
+            }
             let now = Instant::now();
             if finish_deadline.is_some_and(|deadline| now > deadline) {
                 if finished_received {
@@ -1134,7 +1247,6 @@ impl XdndSource {
                         "XDND finished grace ended: selection_requests={}, data_requests={}",
                         self.selection_requests, self.data_requests
                     );
-                } else {
                 }
                 break;
             }
@@ -1146,10 +1258,16 @@ impl XdndSource {
             if let Some(event) = self.conn.poll_for_event().map_err(|err| err.to_string())? {
                 match event {
                     Event::MotionNotify(event) if !waiting_for_finished => {
-                        self.handle_motion(event)?
+                        self.handle_motion(event)?;
+                        if self.handoff_performed {
+                            return Ok(XdndOutcome::HandoffToNative);
+                        }
                     }
                     Event::ButtonPress(event) if !waiting_for_finished => {
-                        self.handle_button_press(event)?
+                        self.handle_button_press(event)?;
+                        if self.handoff_performed {
+                            return Ok(XdndOutcome::HandoffToNative);
+                        }
                     }
                     Event::ButtonRelease(event) if !waiting_for_finished => {
                         waiting_for_finished = self.handle_button_release(event)?;
@@ -1192,6 +1310,9 @@ impl XdndSource {
             } else {
                 if !waiting_for_finished {
                     let pointer = self.update_target_from_pointer()?;
+                    if self.handoff_performed {
+                        return Ok(XdndOutcome::HandoffToNative);
+                    }
                     saw_button_down |= primary_down(pointer.mask);
                     if saw_button_down && !primary_down(pointer.mask) {
                         waiting_for_finished = self.handle_button_release(ButtonReleaseEvent {
@@ -1222,63 +1343,84 @@ impl XdndSource {
             }
         }
 
-        self.conn
-            .destroy_window(self.source_window)
-            .map_err(|err| err.to_string())?;
-        if let Some(preview) = &self.preview {
-            let _ = self.conn.destroy_window(preview.window);
+        if !self.handoff_performed {
+            self.conn
+                .destroy_window(self.source_window)
+                .map_err(|err| err.to_string())?;
+            if let Some(preview) = &self.preview {
+                let _ = self.conn.destroy_window(preview.window);
+            }
+            self.conn.flush().map_err(|err| err.to_string())?;
         }
-        self.conn.flush().map_err(|err| err.to_string())?;
 
         let stats = self.session_stats();
         if !sent_drop {
-            return Ok(DragSessionReport::failed(
+            return Ok(XdndOutcome::Completed(DragSessionReport::failed(
                 DragFailureKind::Cancelled,
                 stats,
                 "XDND drag ended without sending a drop",
-            ));
+            )));
         }
         if self
             .drop_target
             .is_some_and(|target| self.is_anonymous_xdnd_bridge(target))
             && self.drop_target_data_requests == 0
         {
-            return Ok(DragSessionReport::failed(
+            return Ok(XdndOutcome::Completed(DragSessionReport::failed(
                 DragFailureKind::BridgeRejected,
                 stats,
                 format!(
                     "released over native Wayland target through XWayland bridge; XDND cannot deliver to that target from this XWayland editor; {}",
                     self.export_fallback_hint()
                 ),
-            ));
+            )));
         }
         if self.data_requests == 0 {
-            return Ok(DragSessionReport::failed(
+            return Ok(XdndOutcome::Completed(DragSessionReport::failed(
                 DragFailureKind::TargetNoData,
                 stats,
                 format!(
                     "drop target never requested file data; {}",
                     self.export_fallback_hint()
                 ),
-            ));
+            )));
         }
 
         if finished_received {
-            return Ok(DragSessionReport::completed_confirmed(
+            return Ok(XdndOutcome::Completed(DragSessionReport::completed_confirmed(
                 stats,
                 "target sent XdndFinished",
-            ));
+            )));
         }
         if self.post_drop_data_requests > 0 || self.drop_target_data_requests > 0 {
-            return Ok(DragSessionReport::completed_confirmed(
+            return Ok(XdndOutcome::Completed(DragSessionReport::completed_confirmed(
                 stats,
                 "target requested file data after drop",
-            ));
+            )));
         }
-        Ok(DragSessionReport::completed_inferred(
+        Ok(XdndOutcome::Completed(DragSessionReport::completed_inferred(
             stats,
             "target inspected file data before drop and the drop was sent",
-        ))
+        )))
+    }
+
+    fn perform_native_handoff(&mut self) -> Result<(), String> {
+        self.log("handoff: pointer over native Wayland surface; switching to native drag");
+        self.leave_current_target()?;
+        if let Some(preview) = self.preview.take() {
+            self.conn
+                .destroy_window(preview.window)
+                .map_err(|err| err.to_string())?;
+        }
+        self.conn
+            .set_selection_owner(x11rb::NONE, self.atoms.xdnd_selection, CURRENT_TIME)
+            .map_err(|err| err.to_string())?;
+        self.conn
+            .destroy_window(self.source_window)
+            .map_err(|err| err.to_string())?;
+        self.conn.flush().map_err(|err| err.to_string())?;
+        self.handoff_performed = true;
+        Ok(())
     }
 
     fn handle_motion(&mut self, event: MotionNotifyEvent) -> Result<(), String> {
@@ -1706,10 +1848,17 @@ impl XdndSource {
         };
 
         if target != self.current_target {
+            let previous_target = self.current_target;
             self.leave_current_target()?;
             self.current_target = target;
+            if previous_target.is_some_and(|prev| self.is_anonymous_xdnd_bridge(prev))
+                && target.is_none_or(|next| !self.is_anonymous_xdnd_bridge(next))
+            {
+                self.bridge_hover_streak = 0;
+            }
             if let Some(target) = target {
                 if self.is_real_xdnd_target(target) {
+                    self.bridge_hover_streak = 0;
                     self.last_real_target = Some(target);
                     self.recent_real_target.note_entered_real(target);
                 }
@@ -1735,7 +1884,83 @@ impl XdndSource {
             let _ = preview.update(&self.conn, pointer.root_x, pointer.root_y);
         }
 
+        let over_origin = self.is_pointer_over_origin(root, pointer.root_x, pointer.root_y)?;
+        if !over_origin {
+            self.saw_pointer_leave_origin = true;
+        }
+
+        let route_enabled = wayland_native::route_enabled();
+        let button1_held = primary_down(pointer.mask);
+        let is_real_target = self
+            .current_target
+            .is_some_and(|target| self.is_real_xdnd_target(target));
+        let over_bridge = self.current_target.is_some_and(|target| {
+            route_enabled && self.is_anonymous_xdnd_bridge(target)
+        });
+        self.bridge_hover_streak = bridge_hover_streak_after_sample(
+            self.bridge_hover_streak,
+            route_enabled,
+            over_bridge,
+            button1_held,
+            over_origin,
+            is_real_target,
+            self.saw_pointer_leave_origin,
+        );
+        let handoff = evaluate_bridge_handoff(
+            self.bridge_hover_streak,
+            route_enabled,
+            over_bridge,
+            button1_held,
+            over_origin,
+            self.saw_pointer_leave_origin,
+            is_real_target,
+        );
+        if handoff == BridgeHandoffDecision::Handoff {
+            self.perform_native_handoff()?;
+        } else if let Some(reason) = handoff.suppression_log() {
+            let log_once = matches!(
+                handoff,
+                BridgeHandoffDecision::SuppressedStillOverOrigin
+                    | BridgeHandoffDecision::SuppressedNotLeftOrigin
+            );
+            if log_once && !self.logged_handoff_suppressed_origin {
+                self.logged_handoff_suppressed_origin = true;
+                self.log(reason);
+            } else if self.verbose_logging() {
+                self.log(reason);
+            }
+        }
+
         Ok(pointer)
+    }
+
+    fn is_pointer_over_origin(
+        &self,
+        root: XWindow,
+        _root_x: i16,
+        _root_y: i16,
+    ) -> Result<bool, String> {
+        let mut window = root;
+        loop {
+            let child = self
+                .conn
+                .query_pointer(window)
+                .map_err(|err| err.to_string())?
+                .reply()
+                .map_err(|err| err.to_string())?;
+
+            if child.child == x11rb::NONE {
+                return Ok(self.is_origin_window(window));
+            }
+
+            window = child.child;
+            if self.is_origin_window(window) {
+                return Ok(true);
+            }
+            if window == self.source_window {
+                return Ok(false);
+            }
+        }
     }
 
     fn find_xdnd_target(&self, root_x: i16, root_y: i16) -> Result<Option<XWindow>, String> {
@@ -2136,7 +2361,7 @@ impl XdndSource {
     }
 
     fn is_origin_window(&self, window: XWindow) -> bool {
-        self.origin_window == Some(window)
+        plugin_windows::is_registered_plugin_window(window) || self.origin_window == Some(window)
     }
 
     fn parent_of(&self, window: XWindow) -> Result<Option<XWindow>, String> {
@@ -2308,4 +2533,88 @@ fn set_window_identity(
     )
     .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod bridge_handoff_tests {
+    use super::{
+        bridge_hover_streak_after_sample, evaluate_bridge_handoff, BridgeHandoffDecision,
+        BRIDGE_HANDOFF_STREAK,
+    };
+
+    #[test]
+    fn bridge_streak_increments_after_leaving_origin() {
+        let first = bridge_hover_streak_after_sample(0, true, true, true, false, false, true);
+        assert_eq!(first, 1);
+        let second = bridge_hover_streak_after_sample(first, true, true, true, false, false, true);
+        assert_eq!(second, BRIDGE_HANDOFF_STREAK);
+        assert_eq!(
+            evaluate_bridge_handoff(second, true, true, true, false, true, false),
+            BridgeHandoffDecision::Handoff
+        );
+    }
+
+    #[test]
+    fn bridge_streak_resets_off_bridge_or_release() {
+        assert_eq!(
+            bridge_hover_streak_after_sample(1, true, false, true, false, false, true),
+            0
+        );
+        assert_eq!(
+            bridge_hover_streak_after_sample(1, true, true, false, false, false, true),
+            0
+        );
+        assert_eq!(
+            bridge_hover_streak_after_sample(1, false, true, true, false, false, true),
+            0
+        );
+        assert_eq!(
+            evaluate_bridge_handoff(1, true, true, true, false, true, false),
+            BridgeHandoffDecision::SuppressedStreakInsufficient
+        );
+    }
+
+    #[test]
+    fn bridge_handoff_suppressed_over_origin() {
+        assert_eq!(
+            bridge_hover_streak_after_sample(0, true, true, true, true, false, false),
+            0
+        );
+        assert_eq!(
+            evaluate_bridge_handoff(
+                BRIDGE_HANDOFF_STREAK,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+            ),
+            BridgeHandoffDecision::SuppressedStillOverOrigin
+        );
+    }
+
+    #[test]
+    fn bridge_handoff_suppressed_before_leaving_origin() {
+        assert_eq!(
+            bridge_hover_streak_after_sample(0, true, true, true, false, false, false),
+            0
+        );
+        assert_eq!(
+            evaluate_bridge_handoff(BRIDGE_HANDOFF_STREAK, true, true, true, false, false, false),
+            BridgeHandoffDecision::SuppressedNotLeftOrigin
+        );
+    }
+
+    #[test]
+    fn bridge_handoff_suppressed_on_real_x11_target() {
+        assert_eq!(
+            bridge_hover_streak_after_sample(1, true, false, true, false, true, true),
+            0
+        );
+        assert_eq!(
+            evaluate_bridge_handoff(BRIDGE_HANDOFF_STREAK, true, false, true, false, true, true),
+            BridgeHandoffDecision::SuppressedRealXdndTarget
+        );
+    }
 }
