@@ -151,7 +151,7 @@ fn ns_image_from_preview(preview: &ExternalDragPreview) -> Retained<NSImage> {
     let image = render_drag_chip(preview);
     let size = NSSize::new(image.width as f64, image.height as f64);
     let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
-    let bitmap = unsafe {
+    let Some(bitmap) = (unsafe {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(),
             ptr::null_mut(),
@@ -165,6 +165,8 @@ fn ns_image_from_preview(preview: &ExternalDragPreview) -> Retained<NSImage> {
             (image.width * 4) as isize,
             32,
         )
+    }) else {
+        return ns_image;
     };
     let pixels = bitmap.bitmapData();
     if !pixels.is_null() {
