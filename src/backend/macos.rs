@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::ptr;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession,
-    NSDraggingSource, NSEvent, NSView,
+    NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSDragOperation, NSDraggingContext,
+    NSDraggingItem, NSDraggingSession, NSDraggingSource, NSEvent, NSImage, NSImageRep, NSView,
 };
 use objc2_foundation::{
     NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -13,7 +14,8 @@ use objc2_foundation::{
 use raw_window_handle::RawWindowHandle;
 
 use super::{emit_backend_event, DragWindow, ExternalDragError};
-use crate::ExternalDragPayload;
+use crate::preview_render::{render_drag_chip, CHIP_HEIGHT, CHIP_WIDTH};
+use crate::{ExternalDragPayload, ExternalDragPreview};
 
 define_class!(
     #[unsafe(super = NSObject)]
@@ -47,7 +49,6 @@ pub(super) fn start_external_file_drag(
     payload: ExternalDragPayload,
 ) -> Result<(), ExternalDragError> {
     let ExternalDragPayload { id, paths, preview } = payload;
-    let _ = preview;
 
     if paths.is_empty() {
         return Err(ExternalDragError::EmptyPayload);
@@ -83,13 +84,19 @@ pub(super) fn start_external_file_drag(
         paths.len(),
         file_summary.join(", ")
     ));
-    start_drag_from_view(view, &event, &paths);
+    start_drag_from_view(view, &event, &paths, preview.as_ref());
     Ok(())
 }
 
-fn start_drag_from_view(view: &NSView, event: &NSEvent, paths: &[PathBuf]) {
+fn start_drag_from_view(
+    view: &NSView,
+    event: &NSEvent,
+    paths: &[PathBuf],
+    preview: Option<&ExternalDragPreview>,
+) {
     let location = event.locationInWindow();
-    let items = dragging_items(paths, location);
+    let chip = preview.map(ns_image_from_preview);
+    let items = dragging_items(paths, location, chip.as_ref());
     let item_refs = items.iter().map(|item| &**item).collect::<Vec<_>>();
     let item_array = NSArray::from_slice(&item_refs);
     let mtm = MainThreadMarker::new().expect("AppKit drag source should still be on main thread");
@@ -100,7 +107,13 @@ fn start_drag_from_view(view: &NSView, event: &NSEvent, paths: &[PathBuf]) {
     let _ = Retained::into_raw(source);
 }
 
-fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggingItem>> {
+fn dragging_items(
+    paths: &[PathBuf],
+    location: NSPoint,
+    chip: Option<&Retained<NSImage>>,
+) -> Vec<Retained<NSDraggingItem>> {
+    let width = CHIP_WIDTH as f64;
+    let height = CHIP_HEIGHT as f64;
     paths
         .iter()
         .enumerate()
@@ -114,17 +127,54 @@ fn dragging_items(paths: &[PathBuf], location: NSPoint) -> Vec<Retained<NSDraggi
                 NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
             let offset = index as f64 * 4.0;
             unsafe {
+                let contents = chip.map(|image| {
+                    let image: &NSImage = image;
+                    image as &objc2::runtime::AnyObject
+                });
                 dragging_item.setDraggingFrame_contents(
                     NSRect::new(
-                        NSPoint::new(location.x - 58.0 + offset, location.y - 24.0 - offset),
-                        NSSize::new(116.0, 48.0),
+                        NSPoint::new(
+                            location.x - width * 0.5 + offset,
+                            location.y - height * 0.5 - offset,
+                        ),
+                        NSSize::new(width, height),
                     ),
-                    None,
+                    contents,
                 );
             }
             dragging_item
         })
         .collect()
+}
+
+fn ns_image_from_preview(preview: &ExternalDragPreview) -> Retained<NSImage> {
+    let image = render_drag_chip(preview);
+    let size = NSSize::new(image.width as f64, image.height as f64);
+    let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
+    let bitmap = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            ptr::null_mut(),
+            image.width as isize,
+            image.height as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            (image.width * 4) as isize,
+            32,
+        )
+    };
+    let pixels = bitmap.bitmapData();
+    if !pixels.is_null() {
+        unsafe {
+            ptr::copy_nonoverlapping(image.rgba.as_ptr(), pixels, image.rgba.len());
+        }
+    }
+    let rep: &NSImageRep = bitmap.as_ref();
+    ns_image.addRepresentation(rep);
+    ns_image
 }
 
 fn validate_paths(paths: &[PathBuf]) -> Result<Vec<String>, String> {

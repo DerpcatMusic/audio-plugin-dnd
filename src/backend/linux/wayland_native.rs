@@ -60,6 +60,9 @@ use crate::backend::{
     ExternalDragLifecyclePhase,
 };
 use crate::data_device::ActiveWaylandDrag;
+use crate::preview_render::{
+    render_drag_chip_sized, rgba_to_argb8888_premul, CHIP_HEIGHT, CHIP_WIDTH,
+};
 use crate::request::{WaylandDragOffer, WaylandExternalDragRequest};
 use crate::{ExternalDragPreview, FileDragPayloadData};
 
@@ -315,6 +318,33 @@ fn linger_and_teardown(
         drag_id,
         ExternalDragLifecyclePhase::Lingering,
     ));
+    // Tear down the drag surface and clear in-flight BEFORE the grace wait so the
+    // next drag is not blocked for the full linger window.
+    teardown_native_session(drag_id, &connection, state);
+    crate::backend::linux::clear_drag_active(drag_id);
+    emit_backend_lifecycle_event(ExternalDragLifecycleEvent::new(
+        drag_id,
+        ExternalDragLifecyclePhase::Finished,
+    ));
+    // #region agent log
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "{{\"sessionId\":\"dbdcd7\",\"hypothesisId\":\"H2\",\"runId\":\"post-fix\",\"location\":\"wayland_native.rs:linger_and_teardown\",\"message\":\"finished before linger wait\",\"data\":{{\"drag_id\":{drag_id}}},\"timestamp\":{ts}}}\n"
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/derpcat/projects/drop-recorder/.cursor/debug-dbdcd7.log")
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+    // #endregion
     emit_backend_event(format!(
         "[dnd#{drag_id}] Native Wayland bridge linger started (up to {}ms)",
         BRIDGE_LINGER_TIMEOUT.as_millis()
@@ -341,7 +371,25 @@ fn linger_and_teardown(
     emit_backend_event(format!(
         "[dnd#{drag_id}] Native Wayland bridge linger ending: {reason}"
     ));
-    teardown_native_session(drag_id, &connection, state);
+    // #region agent log
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = format!(
+            "{{\"sessionId\":\"dbdcd7\",\"hypothesisId\":\"H1\",\"runId\":\"post-fix\",\"location\":\"wayland_native.rs:linger_and_teardown\",\"message\":\"linger wait ended\",\"data\":{{\"drag_id\":{drag_id},\"reason\":\"{reason}\"}},\"timestamp\":{ts}}}\n"
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/home/derpcat/projects/drop-recorder/.cursor/debug-dbdcd7.log")
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+    // #endregion
 }
 
 fn teardown_native_session(drag_id: u64, connection: &Connection, state: &mut NativeDragState) {
@@ -536,8 +584,8 @@ struct NativeDragIcon {
 }
 
 impl NativeDragIcon {
-    const WIDTH: i32 = 192;
-    const HEIGHT: i32 = 88;
+    const WIDTH: i32 = CHIP_WIDTH as i32;
+    const HEIGHT: i32 = CHIP_HEIGHT as i32;
     const STRIDE: i32 = Self::WIDTH * 4;
 
     fn create<State>(
@@ -561,7 +609,10 @@ impl NativeDragIcon {
                 wl_shm::Format::Argb8888,
             )
             .map_err(|err| err.to_string())?;
-        render_drag_icon(canvas, Self::WIDTH as usize, Self::HEIGHT as usize, preview);
+        let image = render_drag_chip_sized(preview, CHIP_WIDTH, CHIP_HEIGHT);
+        let packed = rgba_to_argb8888_premul(&image.rgba);
+        let copy_len = canvas.len().min(packed.len());
+        canvas[..copy_len].copy_from_slice(&packed[..copy_len]);
         surface.attach(Some(buffer.wl_buffer()), 0, 0);
         surface.damage_buffer(0, 0, Self::WIDTH, Self::HEIGHT);
         surface.commit();
@@ -571,152 +622,6 @@ impl NativeDragIcon {
             _buffer: buffer,
         })
     }
-}
-
-fn render_drag_icon(canvas: &mut [u8], width: usize, height: usize, preview: &ExternalDragPreview) {
-    fill_rect(
-        canvas,
-        width,
-        height,
-        0,
-        0,
-        width,
-        height,
-        [22, 24, 31, 230],
-    );
-    fill_rect(
-        canvas,
-        width,
-        height,
-        1,
-        1,
-        width - 2,
-        height - 2,
-        [34, 37, 46, 238],
-    );
-    match preview {
-        ExternalDragPreview::Waveform { buckets } => {
-            render_waveform_icon(canvas, width, height, buckets)
-        }
-        ExternalDragPreview::Spectral {
-            columns,
-            rows,
-            energy,
-            ..
-        } => render_spectral_icon(canvas, width, height, *columns, *rows, energy),
-    }
-}
-
-fn render_waveform_icon(canvas: &mut [u8], width: usize, height: usize, buckets: &[(f32, f32)]) {
-    let left = 12;
-    let right = width.saturating_sub(12);
-    let top = 12;
-    let bottom = height.saturating_sub(12);
-    let center = (top + bottom) / 2;
-    fill_rect(
-        canvas,
-        width,
-        height,
-        left,
-        center,
-        right - left,
-        1,
-        [86, 93, 111, 170],
-    );
-    let usable_width = right.saturating_sub(left).max(1);
-    let len = buckets.len().saturating_sub(1).max(1);
-    for (index, (min, max)) in buckets.iter().enumerate() {
-        let x = left + index * usable_width / len;
-        let y1 = (center as f32 - max.clamp(-1.0, 1.0) * (bottom - top) as f32 * 0.44)
-            .round()
-            .clamp(top as f32, bottom as f32) as usize;
-        let y2 = (center as f32 - min.clamp(-1.0, 1.0) * (bottom - top) as f32 * 0.44)
-            .round()
-            .clamp(top as f32, bottom as f32) as usize;
-        let y = y1.min(y2);
-        let h = y1.max(y2).saturating_sub(y).max(1);
-        fill_rect(canvas, width, height, x, y, 2, h, [104, 229, 196, 245]);
-    }
-}
-
-fn render_spectral_icon(
-    canvas: &mut [u8],
-    width: usize,
-    height: usize,
-    columns: usize,
-    rows: usize,
-    energy: &[f32],
-) {
-    if columns == 0 || rows == 0 || energy.is_empty() {
-        return;
-    }
-    let left = 10;
-    let top = 10;
-    let usable_width = width.saturating_sub(20).max(1);
-    let usable_height = height.saturating_sub(20).max(1);
-    for y in 0..usable_height {
-        let row = rows
-            .saturating_sub(1)
-            .saturating_sub(y * rows / usable_height);
-        for x in 0..usable_width {
-            let column = x * columns / usable_width;
-            let value = energy
-                .get(row.saturating_mul(columns).saturating_add(column))
-                .copied()
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0);
-            let color = spectral_color(value);
-            set_pixel(canvas, width, left + x, top + y, color);
-        }
-    }
-}
-
-fn spectral_color(value: f32) -> [u8; 4] {
-    let cold = [45.0, 54.0, 82.0];
-    let mid = [49.0, 180.0, 178.0];
-    let hot = [247.0, 214.0, 112.0];
-    let (a, b, t) = if value < 0.55 {
-        (cold, mid, value / 0.55)
-    } else {
-        (mid, hot, (value - 0.55) / 0.45)
-    };
-    [
-        (a[0] + (b[0] - a[0]) * t).round() as u8,
-        (a[1] + (b[1] - a[1]) * t).round() as u8,
-        (a[2] + (b[2] - a[2]) * t).round() as u8,
-        245,
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fill_rect(
-    canvas: &mut [u8],
-    width: usize,
-    height: usize,
-    x: usize,
-    y: usize,
-    rect_width: usize,
-    rect_height: usize,
-    color: [u8; 4],
-) {
-    let max_y = y.saturating_add(rect_height).min(height);
-    let max_x = x.saturating_add(rect_width).min(width);
-    for py in y..max_y {
-        for px in x..max_x {
-            set_pixel(canvas, width, px, py, color);
-        }
-    }
-}
-
-fn set_pixel(canvas: &mut [u8], width: usize, x: usize, y: usize, [r, g, b, a]: [u8; 4]) {
-    let offset = (y * width + x) * 4;
-    if offset + 3 >= canvas.len() {
-        return;
-    }
-    canvas[offset] = b;
-    canvas[offset + 1] = g;
-    canvas[offset + 2] = r;
-    canvas[offset + 3] = a;
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for NativeDragState {

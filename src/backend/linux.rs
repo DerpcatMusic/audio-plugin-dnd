@@ -20,6 +20,9 @@ use super::{
     ExternalDragLifecycleEvent, ExternalDragLifecyclePhase,
 };
 use crate::platform::{DragBackendPlan, DragEndpointKind, DragRoute};
+use crate::preview_render::{
+    render_drag_chip_sized, rgba_to_bgra, CHIP_HEIGHT, CHIP_WIDTH,
+};
 use crate::{ExternalDragPayload, ExternalDragPreview, FileDragPayloadData};
 use mime::MimeTargets;
 use raw_window_handle::RawWindowHandle;
@@ -28,9 +31,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as RandrConnectionExt;
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ButtonPressEvent, ButtonReleaseEvent, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt, CoordMode, CreateGCAux, CreateWindowAux, EventMask, Gcontext, KeyButMask,
-    MotionNotifyEvent, Point, PropMode, Rectangle, Screen, Segment, SelectionNotifyEvent,
-    SelectionRequestEvent, StackMode, Window as XWindow, WindowClass,
+    ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Gcontext, ImageFormat, KeyButMask,
+    MotionNotifyEvent, PropMode, Screen, SelectionNotifyEvent, SelectionRequestEvent, StackMode,
+    Window as XWindow, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -80,7 +83,9 @@ impl BridgeHandoffDecision {
     fn suppression_log(self) -> Option<&'static str> {
         match self {
             Self::SuppressedStillOverOrigin => Some("handoff suppressed: still over origin"),
-            Self::SuppressedNotLeftOrigin => Some("handoff suppressed: pointer has not left origin"),
+            Self::SuppressedNotLeftOrigin => {
+                Some("handoff suppressed: pointer has not left origin")
+            }
             Self::SuppressedRealXdndTarget => Some("handoff suppressed: real X11 Xdnd target"),
             Self::SuppressedStreakInsufficient
             | Self::SuppressedNotOverBridge
@@ -194,6 +199,12 @@ pub(super) fn is_drag_active(drag_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+pub(super) fn clear_drag_active(drag_id: u64) {
+    if let Ok(mut active) = active_outbound_drags().lock() {
+        active.remove(&drag_id);
+    }
+}
+
 fn emit_terminal_lifecycle(drag_id: u64, report: &DragSessionReport) {
     let phase = match report.completion {
         DragCompletion::Confirmed | DragCompletion::Inferred => {
@@ -238,26 +249,31 @@ pub(super) fn start_external_file_drag(
         .name("audio-plugin-xdnd-file-drag".to_string())
         .spawn(move || {
             let _active_drag = ActiveOutboundDrag::register(id);
-            let _drag_lock = outbound_drag_mutex()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-
             let paths_for_handoff = paths.clone();
             let preview_for_handoff = preview.clone();
 
-            let route = DragBackendPlan::new(
-                DragRoute::XwaylandToXwayland,
-                DragEndpointKind::XwaylandWindow,
-                DragEndpointKind::Unknown,
-            );
-            emit_backend_event(format!(
-                "[dnd#{id}] XDND worker started: origin={}, route={}",
-                origin_window
-                    .map(|window| format!("0x{window:x}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                route.summary()
-            ));
-            match XdndSource::new(id, paths, preview, origin_window).and_then(XdndSource::run) {
+            // Hold the outbound lock only for the XDND phase. Native Wayland
+            // handoff may linger for seconds — that must not block the next drag.
+            let outcome = {
+                let _drag_lock = outbound_drag_mutex()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let route = DragBackendPlan::new(
+                    DragRoute::XwaylandToXwayland,
+                    DragEndpointKind::XwaylandWindow,
+                    DragEndpointKind::Unknown,
+                );
+                emit_backend_event(format!(
+                    "[dnd#{id}] XDND worker started: origin={}, route={}",
+                    origin_window
+                        .map(|window| format!("0x{window:x}"))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    route.summary()
+                ));
+                XdndSource::new(id, paths, preview, origin_window).and_then(XdndSource::run)
+            };
+
+            match outcome {
                 Ok(XdndOutcome::HandoffToNative) => {
                     let route = DragBackendPlan::new(
                         DragRoute::XwaylandToWaylandBridge,
@@ -268,8 +284,11 @@ pub(super) fn start_external_file_drag(
                         "[dnd#{id}] Native Wayland worker started after XDND handoff; {}",
                         route.summary()
                     ));
-                    match wayland_native::run_native_drag(id, paths_for_handoff, preview_for_handoff)
-                    {
+                    match wayland_native::run_native_drag(
+                        id,
+                        paths_for_handoff,
+                        preview_for_handoff,
+                    ) {
                         Ok(report) => {
                             emit_backend_event(format!(
                                 "[dnd#{id}] Native Wayland drag {}: {}; {}",
@@ -399,20 +418,19 @@ impl XdndAtoms {
 
 struct PreviewWindow {
     window: XWindow,
-    gc_bg: Gcontext,
-    gc_panel: Gcontext,
-    gc_fill: Gcontext,
-    gc_border: Gcontext,
-    gc_wave: Gcontext,
-    gc_glow: Gcontext,
-    gc_mid: Gcontext,
+    gc: Gcontext,
     width: u16,
     height: u16,
+    depth: u8,
     preview: ExternalDragPreview,
-    desktop: PreviewDesktop,
+    desktop: DragCoordinateMapper,
     screen_width: i32,
     screen_height: i32,
 }
+
+/// Static cursor offset for the X11 drag chip (no spring follow).
+const PREVIEW_OFFSET_X: i32 = 20;
+const PREVIEW_OFFSET_Y: i32 = 22;
 
 #[derive(Clone)]
 struct PreviewMonitor {
@@ -435,7 +453,8 @@ struct HyprMonitor {
     x11_y: i32,
 }
 
-struct PreviewDesktop {
+#[derive(Clone)]
+struct DragCoordinateMapper {
     x11_monitors: Vec<PreviewMonitor>,
     hypr_monitors: Vec<HyprMonitor>,
     env_scale: f32,
@@ -447,9 +466,10 @@ impl PreviewWindow {
         conn: &RustConnection,
         screen: &Screen,
         preview: ExternalDragPreview,
+        desktop: DragCoordinateMapper,
     ) -> Result<Self, String> {
-        let width = 224;
-        let height = 90;
+        let width = CHIP_WIDTH as u16;
+        let height = CHIP_HEIGHT as u16;
         let window = conn.generate_id().map_err(|err| err.to_string())?;
         conn.create_window(
             screen.root_depth,
@@ -464,34 +484,24 @@ impl PreviewWindow {
             screen.root_visual,
             &CreateWindowAux::new()
                 .override_redirect(1)
-                .background_pixel(rgb(20, 17, 31))
+                .background_pixel(0)
                 .event_mask(EventMask::EXPOSURE),
         )
         .map_err(|err| err.to_string())?;
 
-        let gc_bg = Self::gc(conn, window, rgb(20, 17, 31), 1)?;
-        let gc_panel = Self::gc(conn, window, rgb(13, 19, 30), 1)?;
-        let gc_fill = Self::gc(conn, window, rgb(75, 58, 116), 1)?;
-        let gc_border = Self::gc(conn, window, rgb(204, 222, 238), 2)?;
-        let gc_wave = Self::gc(conn, window, rgb(169, 222, 255), 2)?;
-        let gc_glow = Self::gc(conn, window, rgb(168, 107, 234), 1)?;
-        let gc_mid = Self::gc(conn, window, rgb(75, 98, 124), 1)?;
-        let desktop = PreviewDesktop::detect(conn, screen);
+        let gc = conn.generate_id().map_err(|err| err.to_string())?;
+        conn.create_gc(gc, window, &CreateGCAux::new())
+            .map_err(|err| err.to_string())?;
         emit_backend_event(format!(
             "[dnd#{drag_id}] Preview desktop map: {}",
             desktop.summary()
         ));
         let preview = Self {
             window,
-            gc_bg,
-            gc_panel,
-            gc_fill,
-            gc_border,
-            gc_wave,
-            gc_glow,
-            gc_mid,
+            gc,
             width,
             height,
+            depth: screen.root_depth,
             preview,
             desktop,
             screen_width: i32::from(screen.width_in_pixels),
@@ -503,24 +513,38 @@ impl PreviewWindow {
         Ok(preview)
     }
 
-    fn gc(
-        conn: &RustConnection,
-        window: XWindow,
-        color: u32,
-        line_width: u32,
-    ) -> Result<Gcontext, String> {
-        let gc = conn.generate_id().map_err(|err| err.to_string())?;
-        conn.create_gc(
-            gc,
-            window,
-            &CreateGCAux::new().foreground(color).line_width(line_width),
-        )
-        .map_err(|err| err.to_string())?;
-        Ok(gc)
-    }
+    fn update(&mut self, conn: &RustConnection, root_x: i16, root_y: i16) -> Result<(), String> {
+        // X11 QueryPointer root coords are already in the X11 root pixel space used by
+        // override-redirect windows. Do NOT run Hyprland logical→X11 remap here — that
+        // double-scales (e.g. 1.5x) and parks the chip far from the cursor.
+        let raw_x = i32::from(root_x);
+        let raw_y = i32::from(root_y);
+        let (mapped_x, mapped_y) = self.desktop.map_point(raw_x, raw_y);
+        let (x, y) = self.clamp_position(raw_x + PREVIEW_OFFSET_X, raw_y + PREVIEW_OFFSET_Y);
+        // #region agent log
+        {
+            use std::io::Write;
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let line = format!(
+                    "{{\"sessionId\":\"dbdcd7\",\"hypothesisId\":\"X11\",\"location\":\"linux.rs:PreviewWindow::update\",\"message\":\"preview place\",\"data\":{{\"n\":{n},\"raw\":[{raw_x},{raw_y}],\"mapped\":[{mapped_x},{mapped_y}],\"placed\":[{x},{y}],\"using\":\"raw\"}},\"timestamp\":{ts}}}\n"
+                );
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/home/derpcat/projects/drop-recorder/.cursor/debug-dbdcd7.log")
+                {
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
+        }
+        // #endregion
 
-    fn update(&self, conn: &RustConnection, root_x: i16, root_y: i16) -> Result<(), String> {
-        let (x, y) = self.preview_position(root_x, root_y);
         conn.configure_window(
             self.window,
             &ConfigureWindowAux::new()
@@ -529,15 +553,13 @@ impl PreviewWindow {
                 .stack_mode(StackMode::ABOVE),
         )
         .map_err(|err| err.to_string())?;
+        // Redraw every move: X11 clears override-redirect windows to background
+        // (black) on expose/configure; without PutImage the chip becomes a black box.
         self.draw(conn)?;
         conn.flush().map_err(|err| err.to_string())
     }
 
-    fn preview_position(&self, root_x: i16, root_y: i16) -> (i32, i32) {
-        let mut x = i32::from(root_x);
-        let mut y = i32::from(root_y);
-        (x, y) = self.desktop.map_point(x, y);
-
+    fn clamp_position(&self, x: i32, y: i32) -> (i32, i32) {
         let max_x = self
             .screen_width
             .saturating_sub(i32::from(self.width))
@@ -546,207 +568,43 @@ impl PreviewWindow {
             .screen_height
             .saturating_sub(i32::from(self.height))
             .saturating_sub(8);
-        ((x + 18).clamp(0, max_x), (y + 18).clamp(0, max_y))
+        (x.clamp(0, max_x), y.clamp(0, max_y))
     }
 
     fn draw(&self, conn: &RustConnection) -> Result<(), String> {
-        conn.poly_fill_rectangle(
+        let image = render_drag_chip_sized(
+            &self.preview,
+            usize::from(self.width),
+            usize::from(self.height),
+        );
+        let packed = pack_x11_pixels(&image.rgba, self.depth);
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
             self.window,
-            self.gc_bg,
-            &[Rectangle {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height: self.height,
-            }],
+            self.gc,
+            self.width,
+            self.height,
+            0,
+            0,
+            0,
+            self.depth,
+            &packed,
         )
         .map_err(|err| err.to_string())?;
-        conn.poly_fill_rectangle(
-            self.window,
-            self.gc_panel,
-            &[Rectangle {
-                x: 5,
-                y: 5,
-                width: self.width.saturating_sub(10),
-                height: self.height.saturating_sub(10),
-            }],
-        )
-        .map_err(|err| err.to_string())?;
-        conn.poly_rectangle(
-            self.window,
-            self.gc_border,
-            &[Rectangle {
-                x: 1,
-                y: 1,
-                width: self.width.saturating_sub(3),
-                height: self.height.saturating_sub(3),
-            }],
-        )
-        .map_err(|err| err.to_string())?;
-
-        match &self.preview {
-            ExternalDragPreview::Waveform { buckets } => {
-                self.draw_waveform(conn, buckets)?;
-            }
-            ExternalDragPreview::Spectral {
-                columns,
-                rows,
-                energy,
-                ..
-            } => {
-                self.draw_spectral(conn, *columns, *rows, energy)?;
-            }
-        }
         Ok(())
     }
+}
 
-    fn draw_waveform(&self, conn: &RustConnection, buckets: &[(f32, f32)]) -> Result<(), String> {
-        let center = (self.height / 2) as i16;
-        let inset = 12.0_f32;
-        let usable_w = (self.width as f32 - inset * 2.0).max(1.0);
-        let scale = self.height as f32 * 0.36;
-        let fill_segments =
-            self.segments_for_waveform(buckets, inset, usable_w, center as f32, scale);
-        if !fill_segments.is_empty() {
-            conn.poly_segment(self.window, self.gc_fill, &fill_segments)
-                .map_err(|err| err.to_string())?;
+fn pack_x11_pixels(rgba: &[u8], depth: u8) -> Vec<u8> {
+    match depth {
+        32 | 24 => {
+            // Native endian BGRA / XRGB for typical TrueColor visuals.
+            rgba_to_bgra(rgba)
         }
-        conn.poly_line(
-            CoordMode::ORIGIN,
-            self.window,
-            self.gc_mid,
-            &[
-                Point { x: 9, y: center },
-                Point {
-                    x: self.width.saturating_sub(9) as i16,
-                    y: center,
-                },
-            ],
-        )
-        .map_err(|err| err.to_string())?;
-
-        let upper = self.points_for_waveform(buckets, inset, usable_w, center as f32, -scale, true);
-        let lower =
-            self.points_for_waveform(buckets, inset, usable_w, center as f32, -scale, false);
-        conn.poly_line(CoordMode::ORIGIN, self.window, self.gc_glow, &upper)
-            .map_err(|err| err.to_string())?;
-        conn.poly_line(CoordMode::ORIGIN, self.window, self.gc_glow, &lower)
-            .map_err(|err| err.to_string())?;
-        conn.poly_line(CoordMode::ORIGIN, self.window, self.gc_wave, &upper)
-            .map_err(|err| err.to_string())?;
-        conn.poly_line(CoordMode::ORIGIN, self.window, self.gc_wave, &lower)
-            .map_err(|err| err.to_string())
-            .map(|_| ())
-    }
-
-    fn draw_spectral(
-        &self,
-        conn: &RustConnection,
-        columns: usize,
-        rows: usize,
-        energy: &[f32],
-    ) -> Result<(), String> {
-        if columns == 0 || rows == 0 || energy.is_empty() {
-            return Ok(());
+        _ => {
+            // Fallback: still emit 32-bit BGRA; shallow visuals are rare for override-redirect.
+            rgba_to_bgra(rgba)
         }
-
-        let inset = 10_i16;
-        let width = self.width.saturating_sub(20).max(1) as f32;
-        let height = self.height.saturating_sub(20).max(1) as f32;
-        let cell_w = (width / columns as f32).max(1.0);
-        let cell_h = (height / rows as f32).max(1.0);
-        let mut low = Vec::new();
-        let mut mid = Vec::new();
-        let mut high = Vec::new();
-
-        for column in 0..columns {
-            for row in 0..rows {
-                let value = energy
-                    .get(column * rows + row)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                if value <= 0.035 {
-                    continue;
-                }
-                let x = inset + (column as f32 * cell_w).round() as i16;
-                let y = inset + ((rows - row - 1) as f32 * cell_h).round() as i16;
-                let rect = Rectangle {
-                    x,
-                    y,
-                    width: cell_w.ceil().max(1.0) as u16,
-                    height: cell_h.ceil().max(1.0) as u16,
-                };
-                if value > 0.66 {
-                    high.push(rect);
-                } else if value > 0.28 {
-                    mid.push(rect);
-                } else {
-                    low.push(rect);
-                }
-            }
-        }
-
-        if !low.is_empty() {
-            conn.poly_fill_rectangle(self.window, self.gc_fill, &low)
-                .map_err(|err| err.to_string())?;
-        }
-        if !mid.is_empty() {
-            conn.poly_fill_rectangle(self.window, self.gc_glow, &mid)
-                .map_err(|err| err.to_string())?;
-        }
-        if !high.is_empty() {
-            conn.poly_fill_rectangle(self.window, self.gc_wave, &high)
-                .map_err(|err| err.to_string())?;
-        }
-        Ok(())
-    }
-
-    fn segments_for_waveform(
-        &self,
-        buckets: &[(f32, f32)],
-        inset: f32,
-        usable_w: f32,
-        center: f32,
-        scale: f32,
-    ) -> Vec<Segment> {
-        let len = buckets.len().saturating_sub(1).max(1);
-        buckets
-            .iter()
-            .enumerate()
-            .map(|(index, (min, max))| {
-                let x = (inset + index as f32 / len as f32 * usable_w).round() as i16;
-                Segment {
-                    x1: x,
-                    y1: (center - max * scale).round() as i16,
-                    x2: x,
-                    y2: (center - min * scale).round() as i16,
-                }
-            })
-            .collect()
-    }
-
-    fn points_for_waveform(
-        &self,
-        buckets: &[(f32, f32)],
-        inset: f32,
-        usable_w: f32,
-        center: f32,
-        scale: f32,
-        upper: bool,
-    ) -> Vec<Point> {
-        let len = buckets.len().saturating_sub(1).max(1);
-        buckets
-            .iter()
-            .enumerate()
-            .map(|(index, (min, max))| {
-                let value = if upper { *max } else { *min };
-                Point {
-                    x: (inset + index as f32 / len as f32 * usable_w).round() as i16,
-                    y: (center + value * scale).round() as i16,
-                }
-            })
-            .collect()
     }
 }
 
@@ -785,11 +643,12 @@ impl HyprMonitor {
     }
 }
 
-impl PreviewDesktop {
-    fn detect(conn: &RustConnection, screen: &Screen) -> Self {
-        let env_scale = preview_env_scale();
-        let x11_monitors = preview_monitors(conn, screen, env_scale);
-        let hypr_monitors = hypr_preview_monitors(&x11_monitors);
+impl DragCoordinateMapper {
+    fn new(
+        x11_monitors: Vec<PreviewMonitor>,
+        hypr_monitors: Vec<HyprMonitor>,
+        env_scale: f32,
+    ) -> Self {
         Self {
             x11_monitors,
             hypr_monitors,
@@ -797,8 +656,15 @@ impl PreviewDesktop {
         }
     }
 
+    fn detect(conn: &RustConnection, screen: &Screen) -> Self {
+        let env_scale = preview_env_scale();
+        let x11_monitors = preview_monitors(conn, screen, env_scale);
+        let hypr_monitors = hypr_preview_monitors(&x11_monitors);
+        Self::new(x11_monitors, hypr_monitors, env_scale)
+    }
+
     fn map_point(&self, x: i32, y: i32) -> (i32, i32) {
-        if !preview_coordinate_remap_enabled() {
+        if !self.coordinate_remap_enabled() {
             return (x, y);
         }
 
@@ -838,11 +704,24 @@ impl PreviewDesktop {
         (x, y)
     }
 
+    fn target_point(&self, x: i32, y: i32) -> (i32, i32) {
+        // QueryPointer / MotionNotify / ButtonRelease root coords are already X11
+        // physical pixels (same space as ConfigureWindow and XdndPosition). Remapping
+        // Hyprland logical→X11 here double-scales on force_zero_scaling desktops and
+        // parks the drop hotspot / hit-test far from the cursor.
+        let _ = self;
+        (x, y)
+    }
+
     fn map_x11_to_logical(&self, x: i32, y: i32) -> Option<(i32, i32)> {
         self.hypr_monitors
             .iter()
             .find(|monitor| monitor.contains_x11(x, y))
             .map(|monitor| monitor.map_x11_to_logical(x, y))
+    }
+
+    fn coordinate_remap_enabled(&self) -> bool {
+        preview_coordinate_remap_enabled().unwrap_or(!self.hypr_monitors.is_empty())
     }
 
     fn summary(&self) -> String {
@@ -886,10 +765,6 @@ impl PreviewDesktop {
     }
 }
 
-fn rgb(red: u32, green: u32, blue: u32) -> u32 {
-    (red << 16) | (green << 8) | blue
-}
-
 fn contains_point(x: i16, y: i16, width: u16, height: u16, point_x: i16, point_y: i16) -> bool {
     let x = x as i32;
     let y = y as i32;
@@ -898,6 +773,10 @@ fn contains_point(x: i16, y: i16, width: u16, height: u16, point_x: i16, point_y
     let point_x = point_x as i32;
     let point_y = point_y as i32;
     point_x >= x && point_y >= y && point_x < x + width && point_y < y + height
+}
+
+fn clamp_i32_to_i16(value: i32) -> i16 {
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 fn preview_monitors(
@@ -1019,7 +898,7 @@ fn preview_env_scale() -> f32 {
     .unwrap_or(1.0)
 }
 
-fn preview_coordinate_remap_enabled() -> bool {
+fn preview_coordinate_remap_enabled() -> Option<bool> {
     std::env::var("AUDIO_PLUGIN_DND_PREVIEW_REMAP")
         .map(|value| {
             matches!(
@@ -1027,7 +906,7 @@ fn preview_coordinate_remap_enabled() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false)
+        .ok()
 }
 
 struct XdndSource {
@@ -1037,6 +916,7 @@ struct XdndSource {
     atoms: XdndAtoms,
     source_window: XWindow,
     origin_window: Option<XWindow>,
+    coordinates: DragCoordinateMapper,
     file_payload: FileDragPayloadData,
     portal_filetransfer_key: Option<Vec<u8>>,
     last_event_time: u32,
@@ -1144,8 +1024,14 @@ impl XdndSource {
             }
         };
 
-        let preview =
-            preview.and_then(|preview| PreviewWindow::new(drag_id, &conn, screen, preview).ok());
+        let coordinates = DragCoordinateMapper::detect(&conn, screen);
+        emit_backend_event(format!(
+            "[dnd#{drag_id}] Coordinate map: {}",
+            coordinates.summary()
+        ));
+        let preview = preview.and_then(|preview| {
+            PreviewWindow::new(drag_id, &conn, screen, preview, coordinates.clone()).ok()
+        });
 
         Ok(Self {
             drag_id,
@@ -1154,6 +1040,7 @@ impl XdndSource {
             atoms,
             source_window,
             origin_window,
+            coordinates,
             file_payload: FileDragPayloadData::new(paths)?,
             portal_filetransfer_key,
             last_event_time: timestamp,
@@ -1207,6 +1094,13 @@ impl XdndSource {
         } else {
             "hover payload"
         }
+    }
+
+    fn target_point(&self, root_x: i16, root_y: i16) -> (i16, i16) {
+        let (x, y) = self
+            .coordinates
+            .target_point(i32::from(root_x), i32::from(root_y));
+        (clamp_i32_to_i16(x), clamp_i32_to_i16(y))
     }
 
     fn note_event_time(&mut self, time: u32) {
@@ -1387,26 +1281,31 @@ impl XdndSource {
         }
 
         if finished_received {
-            return Ok(XdndOutcome::Completed(DragSessionReport::completed_confirmed(
-                stats,
-                "target sent XdndFinished",
-            )));
+            return Ok(XdndOutcome::Completed(
+                DragSessionReport::completed_confirmed(stats, "target sent XdndFinished"),
+            ));
         }
         if self.post_drop_data_requests > 0 || self.drop_target_data_requests > 0 {
-            return Ok(XdndOutcome::Completed(DragSessionReport::completed_confirmed(
-                stats,
-                "target requested file data after drop",
-            )));
+            return Ok(XdndOutcome::Completed(
+                DragSessionReport::completed_confirmed(
+                    stats,
+                    "target requested file data after drop",
+                ),
+            ));
         }
-        Ok(XdndOutcome::Completed(DragSessionReport::completed_inferred(
-            stats,
-            "target inspected file data before drop and the drop was sent",
-        )))
+        Ok(XdndOutcome::Completed(
+            DragSessionReport::completed_inferred(
+                stats,
+                "target inspected file data before drop and the drop was sent",
+            ),
+        ))
     }
 
     fn perform_native_handoff(&mut self) -> Result<(), String> {
         self.log("handoff: pointer over native Wayland surface; switching to native drag");
         self.leave_current_target()?;
+        // Destroy X11 preview — a lingering override-redirect window under the
+        // cursor blocks Wayland DnD. Native path uses a static wl_data_device icon.
         if let Some(preview) = self.preview.take() {
             self.conn
                 .destroy_window(preview.window)
@@ -1435,6 +1334,11 @@ impl XdndSource {
 
     fn handle_button_release(&mut self, event: ButtonReleaseEvent) -> Result<bool, String> {
         self.note_event_time(event.time);
+        let (root_x, root_y) = self.target_point(event.root_x, event.root_y);
+        self.log(format!(
+            "XDND release coordinates: raw={},{} mapped={},{}",
+            event.root_x, event.root_y, root_x, root_y
+        ));
         let Some(target) = self.current_target else {
             self.leave_current_target()?;
             return Err(self.no_target_diagnostics());
@@ -1444,7 +1348,7 @@ impl XdndSource {
             return Err("drop released back on plugin window; cancelled".to_string());
         }
         let drop_target = if self.is_anonymous_xdnd_bridge(target) {
-            self.bridge_release_target(target, event.root_x, event.root_y)?
+            self.bridge_release_target(target, root_x, root_y)?
         } else {
             target
         };
@@ -1657,13 +1561,12 @@ impl XdndSource {
     }
 
     fn preview_position_diagnostics(&self, root_x: i16, root_y: i16) -> String {
-        self.preview
-            .as_ref()
-            .map(|preview| {
-                let (x, y) = preview.preview_position(root_x, root_y);
-                format!("preview={x},{y}")
-            })
-            .unwrap_or_else(|| "preview=none".to_string())
+        let preview_state = if self.preview.is_some() {
+            "preview=active"
+        } else {
+            "preview=none"
+        };
+        format!("mapped={root_x},{root_y}; {preview_state}")
     }
 
     fn handle_selection_request(&mut self, event: SelectionRequestEvent) -> Result<(), String> {
@@ -1841,8 +1744,38 @@ impl XdndSource {
             .reply()
             .map_err(|err| err.to_string())?;
 
+        let (target_x, target_y) = self.target_point(pointer.root_x, pointer.root_y);
+        // #region agent log
+        {
+            use std::io::Write;
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let mapped = self.coordinates.map_point(
+                    i32::from(pointer.root_x),
+                    i32::from(pointer.root_y),
+                );
+                let line = format!(
+                    "{{\"sessionId\":\"dbdcd7\",\"hypothesisId\":\"X11\",\"location\":\"linux.rs:update_target_from_pointer\",\"message\":\"xdnd target point\",\"data\":{{\"n\":{n},\"raw\":[{},{}],\"mapped\":[{},{}],\"target\":[{target_x},{target_y}],\"using\":\"raw\"}},\"timestamp\":{ts}}}\n",
+                    pointer.root_x, pointer.root_y, mapped.0, mapped.1
+                );
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/home/derpcat/projects/drop-recorder/.cursor/debug-dbdcd7.log")
+                {
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
+        }
+        // #endregion
+
         let target = if pointer.same_screen {
-            self.find_xdnd_target(pointer.root_x, pointer.root_y)?
+            self.find_xdnd_target(target_x, target_y)?
         } else {
             None
         };
@@ -1878,13 +1811,13 @@ impl XdndSource {
         }
 
         if let Some(target) = self.current_target {
-            self.send_position(target, pointer.root_x, pointer.root_y)?;
+            self.send_position(target, target_x, target_y)?;
         }
-        if let Some(preview) = &self.preview {
+        if let Some(preview) = &mut self.preview {
             let _ = preview.update(&self.conn, pointer.root_x, pointer.root_y);
         }
 
-        let over_origin = self.is_pointer_over_origin(root, pointer.root_x, pointer.root_y)?;
+        let over_origin = self.is_pointer_over_origin(root, target_x, target_y)?;
         if !over_origin {
             self.saw_pointer_leave_origin = true;
         }
@@ -1894,9 +1827,9 @@ impl XdndSource {
         let is_real_target = self
             .current_target
             .is_some_and(|target| self.is_real_xdnd_target(target));
-        let over_bridge = self.current_target.is_some_and(|target| {
-            route_enabled && self.is_anonymous_xdnd_bridge(target)
-        });
+        let over_bridge = self
+            .current_target
+            .is_some_and(|target| route_enabled && self.is_anonymous_xdnd_bridge(target));
         self.bridge_hover_streak = bridge_hover_streak_after_sample(
             self.bridge_hover_streak,
             route_enabled,
@@ -1936,31 +1869,13 @@ impl XdndSource {
 
     fn is_pointer_over_origin(
         &self,
-        root: XWindow,
-        _root_x: i16,
-        _root_y: i16,
+        _root: XWindow,
+        root_x: i16,
+        root_y: i16,
     ) -> Result<bool, String> {
-        let mut window = root;
-        loop {
-            let child = self
-                .conn
-                .query_pointer(window)
-                .map_err(|err| err.to_string())?
-                .reply()
-                .map_err(|err| err.to_string())?;
-
-            if child.child == x11rb::NONE {
-                return Ok(self.is_origin_window(window));
-            }
-
-            window = child.child;
-            if self.is_origin_window(window) {
-                return Ok(true);
-            }
-            if window == self.source_window {
-                return Ok(false);
-            }
-        }
+        Ok(self
+            .origin_window
+            .is_some_and(|origin| self.window_contains_root_point(origin, root_x, root_y)))
     }
 
     fn find_xdnd_target(&self, root_x: i16, root_y: i16) -> Result<Option<XWindow>, String> {
@@ -2012,23 +1927,7 @@ impl XdndSource {
                 continue;
             }
 
-            let Some(geometry) = self
-                .conn
-                .get_geometry(candidate)
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-            else {
-                continue;
-            };
-
-            if !contains_point(
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                root_x,
-                root_y,
-            ) {
+            if !self.window_contains_root_point(candidate, root_x, root_y) {
                 continue;
             }
 
@@ -2067,23 +1966,7 @@ impl XdndSource {
                 continue;
             }
 
-            let Some(geometry) = self
-                .conn
-                .get_geometry(candidate)
-                .ok()
-                .and_then(|cookie| cookie.reply().ok())
-            else {
-                continue;
-            };
-
-            if !contains_point(
-                geometry.x,
-                geometry.y,
-                geometry.width,
-                geometry.height,
-                root_x,
-                root_y,
-            ) {
+            if !self.window_contains_root_point(candidate, root_x, root_y) {
                 continue;
             }
 
@@ -2148,16 +2031,24 @@ impl XdndSource {
             .get_geometry(window)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
-            .is_some_and(|geometry| {
-                contains_point(
-                    geometry.x,
-                    geometry.y,
-                    geometry.width,
-                    geometry.height,
-                    root_x,
-                    root_y,
-                )
+            .and_then(|geometry| {
+                let root = self.conn.setup().roots[self.screen_num].root;
+                self.conn
+                    .translate_coordinates(root, window, root_x, root_y)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .map(|translated| {
+                        contains_point(
+                            0,
+                            0,
+                            geometry.width,
+                            geometry.height,
+                            translated.dst_x,
+                            translated.dst_y,
+                        )
+                    })
             })
+            .unwrap_or(false)
     }
 
     fn no_target_diagnostics(&self) -> String {
@@ -2167,13 +2058,27 @@ impl XdndSource {
             .query_pointer(root)
             .ok()
             .and_then(|cookie| cookie.reply().ok());
+        let mapped_pointer = pointer
+            .as_ref()
+            .map(|pointer| self.target_point(pointer.root_x, pointer.root_y));
         let pointer_position = pointer
             .as_ref()
-            .map(|pointer| format!("{},{}", pointer.root_x, pointer.root_y))
+            .map(|pointer| {
+                let (mapped_x, mapped_y) =
+                    mapped_pointer.unwrap_or((pointer.root_x, pointer.root_y));
+                format!(
+                    "raw={},{} mapped={},{}",
+                    pointer.root_x, pointer.root_y, mapped_x, mapped_y
+                )
+            })
             .unwrap_or_else(|| "unknown".to_string());
         let pointer_window = pointer
             .as_ref()
-            .and_then(|pointer| self.window_at(root, pointer.root_x, pointer.root_y).ok())
+            .and_then(|pointer| {
+                let (mapped_x, mapped_y) =
+                    mapped_pointer.unwrap_or((pointer.root_x, pointer.root_y));
+                self.window_at(root, mapped_x, mapped_y).ok()
+            })
             .flatten();
         let active_window = self
             .conn
@@ -2202,7 +2107,11 @@ impl XdndSource {
             .unwrap_or_else(|| "none".to_string());
         let bridge_candidates = pointer
             .as_ref()
-            .map(|pointer| self.xdnd_bridge_diagnostics(root, pointer.root_x, pointer.root_y))
+            .map(|pointer| {
+                let (mapped_x, mapped_y) =
+                    mapped_pointer.unwrap_or((pointer.root_x, pointer.root_y));
+                self.xdnd_bridge_diagnostics(root, mapped_x, mapped_y)
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         format!(
@@ -2249,14 +2158,7 @@ impl XdndSource {
                     geometry.y,
                     geometry.width,
                     geometry.height,
-                    contains_point(
-                        geometry.x,
-                        geometry.y,
-                        geometry.width,
-                        geometry.height,
-                        root_x,
-                        root_y,
-                    )
+                    self.window_contains_root_point(candidate, root_x, root_y)
                 ))
             })
             .take(4)
@@ -2337,31 +2239,43 @@ impl XdndSource {
 
     fn window_at(
         &self,
-        mut window: XWindow,
-        _root_x: i16,
-        _root_y: i16,
+        window: XWindow,
+        root_x: i16,
+        root_y: i16,
     ) -> Result<Option<XWindow>, String> {
+        let mut current = window;
+
         loop {
-            let pointer = self
+            let tree = self
                 .conn
-                .query_pointer(window)
+                .query_tree(current)
                 .map_err(|err| err.to_string())?
                 .reply()
                 .map_err(|err| err.to_string())?;
 
-            if pointer.child == x11rb::NONE {
-                return Ok((window != self.source_window).then_some(window));
+            let child = tree.children.iter().rev().copied().find(|&candidate| {
+                candidate != self.source_window
+                    && !self.is_origin_window(candidate)
+                    && self.window_contains_root_point(candidate, root_x, root_y)
+            });
+
+            let Some(child) = child else {
+                return Ok(
+                    (current != self.source_window && !self.is_origin_window(current))
+                        .then_some(current),
+                );
+            };
+
+            if child == current {
+                return Ok(Some(current));
             }
 
-            window = pointer.child;
-            if window == self.source_window || self.is_origin_window(window) {
-                return Ok(None);
-            }
+            current = child;
         }
     }
 
     fn is_origin_window(&self, window: XWindow) -> bool {
-        plugin_windows::is_registered_plugin_window(window) || self.origin_window == Some(window)
+        is_drag_origin_window(self.origin_window, window)
     }
 
     fn parent_of(&self, window: XWindow) -> Result<Option<XWindow>, String> {
@@ -2475,6 +2389,10 @@ impl XdndSource {
     }
 }
 
+fn is_drag_origin_window(origin_window: Option<XWindow>, window: XWindow) -> bool {
+    origin_window == Some(window)
+}
+
 fn primary_down(mask: KeyButMask) -> bool {
     mask.contains(KeyButMask::BUTTON1)
 }
@@ -2538,7 +2456,8 @@ fn set_window_identity(
 #[cfg(test)]
 mod bridge_handoff_tests {
     use super::{
-        bridge_hover_streak_after_sample, evaluate_bridge_handoff, BridgeHandoffDecision,
+        bridge_hover_streak_after_sample, evaluate_bridge_handoff, is_drag_origin_window,
+        BridgeHandoffDecision, DragCoordinateMapper, HyprMonitor, PreviewMonitor,
         BRIDGE_HANDOFF_STREAK,
     };
 
@@ -2581,15 +2500,7 @@ mod bridge_handoff_tests {
             0
         );
         assert_eq!(
-            evaluate_bridge_handoff(
-                BRIDGE_HANDOFF_STREAK,
-                true,
-                true,
-                true,
-                true,
-                false,
-                false
-            ),
+            evaluate_bridge_handoff(BRIDGE_HANDOFF_STREAK, true, true, true, true, false, false),
             BridgeHandoffDecision::SuppressedStillOverOrigin
         );
     }
@@ -2616,5 +2527,133 @@ mod bridge_handoff_tests {
             evaluate_bridge_handoff(BRIDGE_HANDOFF_STREAK, true, false, true, false, true, true),
             BridgeHandoffDecision::SuppressedRealXdndTarget
         );
+    }
+
+    #[test]
+    fn sibling_plugin_window_is_not_the_origin_window() {
+        assert!(is_drag_origin_window(Some(0x100), 0x100));
+        assert!(!is_drag_origin_window(Some(0x100), 0x200));
+        assert!(!is_drag_origin_window(None, 0x200));
+    }
+
+    #[test]
+    fn coordinate_mapper_keeps_single_scale_monitor_identity() {
+        let mapper = DragCoordinateMapper::new(
+            vec![PreviewMonitor {
+                name: "DP-1".to_string(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+            vec![HyprMonitor {
+                name: "DP-1".to_string(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+                x11_x: 0,
+                x11_y: 0,
+            }],
+            1.0,
+        );
+
+        assert_eq!(mapper.map_point(640, 480), (640, 480));
+        assert_eq!(mapper.target_point(640, 480), (640, 480));
+    }
+
+    #[test]
+    fn coordinate_mapper_scales_primary_logical_point_to_x11() {
+        let mapper = DragCoordinateMapper::new(
+            vec![PreviewMonitor {
+                name: "DP-3".to_string(),
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            }],
+            vec![HyprMonitor {
+                name: "DP-3".to_string(),
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+                scale: 1.5,
+                x11_x: 0,
+                x11_y: 0,
+            }],
+            1.0,
+        );
+
+        assert_eq!(mapper.map_point(1280, 720), (1920, 1080));
+        // XDND / preview consumers must keep QueryPointer coords as-is.
+        assert_eq!(mapper.target_point(1280, 720), (1280, 720));
+    }
+
+    #[test]
+    fn coordinate_mapper_uses_secondary_monitor_origin_and_scale() {
+        let mapper = DragCoordinateMapper::new(
+            vec![
+                PreviewMonitor {
+                    name: "DP-3".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 3840,
+                    height: 2160,
+                },
+                PreviewMonitor {
+                    name: "HDMI-A-1".to_string(),
+                    x: 3840,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                },
+            ],
+            vec![
+                HyprMonitor {
+                    name: "DP-3".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 3840,
+                    height: 2160,
+                    scale: 1.5,
+                    x11_x: 0,
+                    x11_y: 0,
+                },
+                HyprMonitor {
+                    name: "HDMI-A-1".to_string(),
+                    x: 2560,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                    scale: 1.0,
+                    x11_x: 3840,
+                    x11_y: 0,
+                },
+            ],
+            1.0,
+        );
+
+        assert_eq!(mapper.map_point(3000, 500), (4280, 500));
+        assert_eq!(mapper.target_point(3000, 500), (3000, 500));
+    }
+
+    #[test]
+    fn coordinate_mapper_keeps_unknown_compositor_identity() {
+        let mapper = DragCoordinateMapper::new(
+            vec![PreviewMonitor {
+                name: "screen".to_string(),
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            }],
+            Vec::new(),
+            1.0,
+        );
+
+        assert_eq!(mapper.map_point(2400, 700), (2400, 700));
+        assert_eq!(mapper.target_point(2400, 700), (2400, 700));
     }
 }

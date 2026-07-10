@@ -1,7 +1,6 @@
 //! Global registry of plugin-owned X11 window IDs.
 //!
-//! GUI adapters register every editor window on open so outbound XDND target
-//! resolution can skip the whole plugin, not only the drag origin window.
+//! GUI adapters register editor windows on open and unregister them on drop.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -46,7 +45,8 @@ impl Drop for PluginWindowGuard {
     }
 }
 
-pub(super) fn is_registered_plugin_window(window: u32) -> bool {
+#[cfg(test)]
+fn is_registered_plugin_window(window: u32) -> bool {
     registry()
         .lock()
         .map(|windows| windows.contains(&window))

@@ -1,6 +1,6 @@
 [package]
 name = "audio-plugin-dnd"
-version = "0.1.16"
+version = "0.1.25"
 edition = "2021"
 rust-version = "1.75"
 description = "Drag-and-drop protocol helpers for Rust audio plugin GUIs"
@@ -61,10 +61,14 @@ version = "0.3"
 default-features = false
 features = [
     "NSApplication",
+    "NSBitmapImageRep",
     "NSDragging",
     "NSDraggingItem",
     "NSDraggingSession",
     "NSEvent",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
     "NSPasteboard",
     "NSPasteboardItem",
     "NSResponder",

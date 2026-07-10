@@ -4,6 +4,50 @@ Concise public-facing release notes. Keep entries newest-first. Use `## x.y.z - 
 
 ## Unreleased
 
+## 0.1.25 - 2026-07-09
+
+- After XWayland→Wayland handoff, the next drag can start immediately instead of waiting out the bridge linger.
+
+## 0.1.24 - 2026-07-09
+
+- Linux XDND drop targeting uses raw X11 pointer coords (no Hyprland scale remap), so the hotspot stays under the cursor on scaled desktops.
+
+## 0.1.23 - 2026-07-09
+
+- Drag chip is static (no spring follow); thumbnails stay signal-accurate.
+- Spectrogram chip reads column-major energy so the heatmap matches the selection.
+- MIDI chip draws real note bars from the dragged selection instead of decorative placeholders.
+
+## 0.1.22 - 2026-07-09
+
+- Linux X11 drag chip redraws while moving so the thumbnail stays visible (no black box).
+- Wayland handoff destroys the X11 preview and uses the native drag icon again so drops are not blocked.
+
+## 0.1.21 - 2026-07-09
+
+- Drag chip spring is softer and more tactile; lean is positional so no black box sits under a tilted thumbnail.
+- After XWayland→Wayland handoff the spring preview keeps following the cursor instead of freezing to a static icon.
+
+## 0.1.20 - 2026-07-09
+
+- Linux drag preview follows the X11 pointer directly on scaled Hyprland desktops (no double scale remap).
+- Native Wayland handoff linger now finishes cleanly so a new drag can start afterward.
+
+## 0.1.19 - 2026-07-09
+
+- Shared high-fidelity drag chip (waveform, spectral, MIDI) used across Linux, macOS, and Windows.
+- Soft spring follow and slight tilt on hosts that move the preview themselves.
+- macOS and Windows now show the custom drag thumbnail instead of the default file icon.
+
+## 0.1.18 - 2026-07-08
+
+- Improved Linux drag positioning and drop targeting on mixed-scale Wayland desktops, especially XWayland plugin windows on secondary monitors.
+- Added clearer drag diagnostics for pointer mapping and target detection.
+
+## 0.1.17 - 2026-07-07
+
+- Allowed outbound drags to target another plugin editor window while still cancelling drops back onto the source editor.
+
 ## 0.1.16 - 2026-07-06
 
 - Fixed premature native Wayland handoff when dragging from an XWayland plugin editor on Hyprland; XDND now stays active over the host and Bitwig until the pointer actually leaves the plugin window.

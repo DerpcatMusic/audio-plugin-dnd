@@ -3,12 +3,23 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// One normalized MIDI note bar for the drag chip (0..1 time and pitch).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MidiChipNote {
+    /// Note start in selection time (0 = left, 1 = right).
+    pub start: f32,
+    /// Note end in selection time.
+    pub end: f32,
+    /// Pitch (0 = low / bottom, 1 = high / top).
+    pub pitch: f32,
+}
+
 /// Optional drag preview metadata for platforms/toolkits that can show it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExternalDragPreview {
     /// Min/max waveform buckets in normalized audio amplitude.
     Waveform { buckets: Vec<(f32, f32)> },
-    /// Compact spectral preview data.
+    /// Compact spectral preview data (column-major energy: `column * rows + row`).
     Spectral {
         columns: usize,
         rows: usize,
@@ -16,6 +27,8 @@ pub enum ExternalDragPreview {
         low_hz: f32,
         high_hz: f32,
     },
+    /// Piano-roll note bars for the dragged MIDI selection.
+    Midi { notes: Vec<MidiChipNote> },
 }
 
 /// File drag payload passed from plugin UI code to a platform backend.

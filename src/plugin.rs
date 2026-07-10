@@ -76,7 +76,8 @@ impl DragPreview {
                 low_hz: preview.low_hz,
                 high_hz: preview.high_hz,
             }),
-            Self::Midi | Self::None => None,
+            Self::Midi => Some(ExternalDragPreview::Midi { notes: Vec::new() }),
+            Self::None => None,
         }
     }
 }

@@ -8,6 +8,7 @@ pub mod file_payload;
 pub mod foreign;
 pub mod platform;
 pub mod plugin;
+pub mod preview_render;
 pub mod queue;
 pub mod request;
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
@@ -37,8 +38,13 @@ pub use plugin::{
     DragArmed, DragExportState, DragFlash, DragPayloadKind, DragPreview, DragStart, DragStatus,
     Point, RenderCache, SpectralDragPreview, DRAG_START_DISTANCE_POINTS,
 };
+pub use preview_render::{
+    render_drag_chip, render_drag_chip_sized, rgba_to_argb8888_premul, rgba_to_bgra, DragChipImage,
+    CHIP_HEIGHT, CHIP_WIDTH,
+};
 pub use queue::{
     next_external_drag_id, ExternalDragPayload, ExternalDragPreview, ExternalDragQueue,
+    MidiChipNote,
 };
 pub use request::{WaylandDragOffer, WaylandExternalDragError, WaylandExternalDragRequest};
 #[cfg(all(target_family = "unix", not(target_os = "macos")))]
